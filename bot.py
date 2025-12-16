@@ -3,16 +3,17 @@ import asyncio
 import discord
 from aiohttp import web
 from openai import OpenAI
+from datetime import date
 
 import memory_store
 
-# ===== 環境変数 =====
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OWNER_ID = os.getenv("OWNER_ID")
 PORT = int(os.getenv("PORT", "10000"))
 
-# ===== OpenAI Client =====
+DAILY_LIMIT = 50
+
 ai = OpenAI(api_key=OPENAI_API_KEY)
 
 # ===== るび人格 =====
@@ -43,13 +44,12 @@ RUBY_SYSTEM = """
 など、距離が近くて安心する言葉を使う。
 """
 
-# ===== Discord設定 =====
 intents = discord.Intents.default()
 intents.message_content = True
 intents.dm_messages = True
 client = discord.Client(intents=intents)
 
-# ===== Webサーバ（Render用）=====
+# ---------------- Web server ----------------
 async def start_web_server():
     async def health(request):
         return web.Response(text="ok")
@@ -64,7 +64,7 @@ async def start_web_server():
     await site.start()
     print(f"Web server listening on {PORT}")
 
-# ===== OpenAI 呼び出し（同期関数）=====
+# ---------------- OpenAI ----------------
 def call_openai(messages):
     resp = ai.responses.create(
         model="gpt-4o-mini",
@@ -72,29 +72,26 @@ def call_openai(messages):
     )
     return (resp.output_text or "").strip()
 
-# ===== ユーティリティ =====
-def is_owner(uid: str) -> bool:
-    return OWNER_ID and str(uid) == str(OWNER_ID)
+# ---------------- Utils ----------------
+def today_str():
+    return date.today().isoformat()
 
 def build_messages(name: str, history: list, user_text: str):
     msgs = [
         {"role": "system", "content": RUBY_SYSTEM},
         {"role": "system", "content": f"相手の呼び名: {name}"},
     ]
-
     for role, content in history[-8:]:
         msgs.append({"role": role, "content": content})
-
     msgs.append({"role": "user", "content": user_text})
     return msgs
 
-# ===== 起動 =====
+# ---------------- Discord events ----------------
 @client.event
 async def on_ready():
     memory_store.init_db()
     print(f"Ruby ready! Logged in as {client.user}")
 
-# ===== メッセージ処理（DM限定）=====
 @client.event
 async def on_message(message: discord.Message):
     if message.author.bot:
@@ -107,9 +104,10 @@ async def on_message(message: discord.Message):
         return
 
     uid = str(message.author.id)
+    ch_id = str(message.channel.id)
     memory_store.init_db()
 
-    # ===== コマンド =====
+    # ---- コマンド ----
     if text == "!whoami":
         await message.channel.send(f"あなたのIDは `{uid}` だよ✨")
         return
@@ -120,29 +118,22 @@ async def on_message(message: discord.Message):
         await message.channel.send(f"了解……✨ これから {name} って呼ぶ……えへへ😊")
         return
 
-    if text.startswith("!allow ") and is_owner(uid):
-        target = text.split()[-1]
-        memory_store.allow_user(target)
-        await message.channel.send(f"`{target}` を許可したよ✨")
-        return
+    # ---- 1日50回制限 ----
+    today = today_str()
+    count = memory_store.get_daily_count(uid, today)
 
-    if text.startswith("!deny ") and is_owner(uid):
-        target = text.split()[-1]
-        memory_store.deny_user(target)
-        await message.channel.send(f"`{target}` を解除したよ💤")
-        return
-
-    # ===== 招待制チェック =====
-    if not is_owner(uid) and not memory_store.is_allowed(uid):
+    if count >= DAILY_LIMIT:
         await message.channel.send(
-            "ここは招待制だよ……😳\n"
-            "`!whoami` でIDを出して、ちちに送ってね✨"
+            "今日はたくさんお話ししたね……😊\n"
+            "るび、ちょっとおやすみするね……🌙\n"
+            "また明日、いっぱい話そ……えへへ✨"
         )
         return
 
-    # ===== 会話処理 =====
+    memory_store.increment_daily_count(uid, today)
+
+    # ---- 会話 ----
     nickname = memory_store.get_nickname(uid) or "ちち"
-    ch_id = str(message.channel.id)
 
     memory_store.add_channel_message(ch_id, uid, text)
     recent = memory_store.get_recent_messages(ch_id, limit=12)
@@ -155,12 +146,10 @@ async def on_message(message: discord.Message):
     messages = build_messages(nickname, history, text)
 
     try:
-        print("calling OpenAI...")
         reply = await asyncio.to_thread(call_openai, messages)
-        print("OpenAI done:", len(reply))
     except Exception as e:
         print("OpenAI ERROR:", e)
-        await message.channel.send(f"{nickname}……ごめん……今つまずいた……💦")
+        await message.channel.send(f"{nickname}……ごめん……今ちょっとつまずいた……💦")
         return
 
     if not reply:
@@ -171,14 +160,12 @@ async def on_message(message: discord.Message):
 
     await message.channel.send(reply[:1900])
 
-# ===== main =====
+# ---------------- main ----------------
 async def main():
     if not DISCORD_TOKEN:
         raise RuntimeError("DISCORD_TOKEN が未設定")
     if not OPENAI_API_KEY:
         raise RuntimeError("OPENAI_API_KEY が未設定")
-    if not OWNER_ID:
-        raise RuntimeError("OWNER_ID が未設定")
 
     await start_web_server()
     await client.start(DISCORD_TOKEN)
