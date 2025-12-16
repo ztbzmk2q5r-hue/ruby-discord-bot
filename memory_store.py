@@ -1,23 +1,17 @@
 import sqlite3
-from typing import Optional, List, Tuple
+from datetime import date
 
-DB_PATH = "memory.db"
+DB_PATH = "ruby_memory.db"
+
+def _conn():
+    # Renderでも雑に安定するようにタイムアウト長め
+    return sqlite3.connect(DB_PATH, timeout=30)
 
 def init_db():
-    con = sqlite3.connect(DB_PATH)
-    cur = con.cursor()
+    conn = _conn()
+    cur = conn.cursor()
 
-    # DM履歴（既存互換）
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS messages (
-        channel_id TEXT,
-        author_id  TEXT,
-        content    TEXT,
-        ts         DATETIME DEFAULT CURRENT_TIMESTAMP
-    )
-    """)
-
-    # ニックネーム
+    # 呼び名
     cur.execute("""
     CREATE TABLE IF NOT EXISTS nicknames (
         user_id TEXT PRIMARY KEY,
@@ -25,190 +19,241 @@ def init_db():
     )
     """)
 
-    # 1日回数カウント
+    # 1日カウント
     cur.execute("""
     CREATE TABLE IF NOT EXISTS daily_counts (
-        user_id TEXT,
-        day TEXT,
-        count INTEGER,
-        PRIMARY KEY (user_id, day)
+        user_id TEXT NOT NULL,
+        ymd TEXT NOT NULL,
+        count INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (user_id, ymd)
     )
     """)
 
-    # ★感情ステート（ユーザーごと）
-    # valence: -100..100（ネガ↔ポジ）
-    # arousal:  0..100（落ち着き↔高揚）
-    # trust:    0..100（距離の近さ）
+    # DMチャンネル内の履歴
     cur.execute("""
-    CREATE TABLE IF NOT EXISTS emotion_state (
-        user_id TEXT PRIMARY KEY,
-        valence INTEGER DEFAULT 0,
-        arousal INTEGER DEFAULT 20,
-        trust   INTEGER DEFAULT 20,
-        last_tag TEXT DEFAULT 'neutral'
+    CREATE TABLE IF NOT EXISTS channel_messages (
+        channel_id TEXT NOT NULL,
+        author_id TEXT NOT NULL,
+        content TEXT NOT NULL,
+        ts INTEGER NOT NULL DEFAULT (strftime('%s','now'))
     )
     """)
 
-    con.commit()
-    con.close()
-
-# ---------- messages ----------
-def add_channel_message(channel_id: str, author_id: str, content: str):
-    con = sqlite3.connect(DB_PATH)
-    cur = con.cursor()
-    cur.execute(
-        "INSERT INTO messages (channel_id, author_id, content) VALUES (?, ?, ?)",
-        (channel_id, author_id, content)
+    # 感情ステート（ユーザー単位）
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS user_emotion (
+        user_id TEXT PRIMARY KEY,
+        valence REAL NOT NULL DEFAULT 0.0,
+        arousal REAL NOT NULL DEFAULT 0.0,
+        tone REAL NOT NULL DEFAULT 0.0,
+        tag TEXT NOT NULL DEFAULT 'neutral'
     )
-    con.commit()
-    con.close()
+    """)
 
-def get_recent_messages(channel_id: str, limit: int = 12) -> List[Tuple[str, str]]:
-    con = sqlite3.connect(DB_PATH)
-    cur = con.cursor()
-    cur.execute(
-        "SELECT author_id, content FROM messages WHERE channel_id=? ORDER BY ts ASC, rowid ASC LIMIT ?",
-        (channel_id, limit)
+    # ユーザー設定（汎用KV）
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS user_kv (
+        user_id TEXT NOT NULL,
+        key TEXT NOT NULL,
+        value TEXT,
+        PRIMARY KEY (user_id, key)
     )
-    rows = cur.fetchall()
-    con.close()
-    return [(r[0], r[1]) for r in rows]
+    """)
 
-# ---------- nickname ----------
+    conn.commit()
+    conn.close()
+
+# ---------- Nickname ----------
 def set_nickname(user_id: str, nickname: str):
-    con = sqlite3.connect(DB_PATH)
-    cur = con.cursor()
-    cur.execute(
-        "INSERT INTO nicknames (user_id, nickname) VALUES (?, ?) "
-        "ON CONFLICT(user_id) DO UPDATE SET nickname=excluded.nickname",
-        (user_id, nickname)
-    )
-    con.commit()
-    con.close()
+    init_db()
+    conn = _conn()
+    cur = conn.cursor()
+    cur.execute("""
+    INSERT INTO nicknames(user_id, nickname) VALUES(?, ?)
+    ON CONFLICT(user_id) DO UPDATE SET nickname=excluded.nickname
+    """, (str(user_id), nickname))
+    conn.commit()
+    conn.close()
 
-def get_nickname(user_id: str) -> Optional[str]:
-    con = sqlite3.connect(DB_PATH)
-    cur = con.cursor()
-    cur.execute("SELECT nickname FROM nicknames WHERE user_id=?", (user_id,))
+def get_nickname(user_id: str):
+    init_db()
+    conn = _conn()
+    cur = conn.cursor()
+    cur.execute("SELECT nickname FROM nicknames WHERE user_id=?", (str(user_id),))
     row = cur.fetchone()
-    con.close()
+    conn.close()
     return row[0] if row else None
 
-# ---------- daily counts ----------
-def get_daily_count(user_id: str, day: str) -> int:
-    con = sqlite3.connect(DB_PATH)
-    cur = con.cursor()
-    cur.execute("SELECT count FROM daily_counts WHERE user_id=? AND day=?", (user_id, day))
+# ---------- Daily counts ----------
+def get_daily_count(user_id: str, ymd: str):
+    init_db()
+    conn = _conn()
+    cur = conn.cursor()
+    cur.execute("SELECT count FROM daily_counts WHERE user_id=? AND ymd=?", (str(user_id), ymd))
     row = cur.fetchone()
-    con.close()
+    conn.close()
     return int(row[0]) if row else 0
 
-def increment_daily_count(user_id: str, day: str):
-    con = sqlite3.connect(DB_PATH)
-    cur = con.cursor()
-    cur.execute(
-        "INSERT INTO daily_counts (user_id, day, count) VALUES (?, ?, 1) "
-        "ON CONFLICT(user_id, day) DO UPDATE SET count = count + 1",
-        (user_id, day)
-    )
-    con.commit()
-    con.close()
-
-# ---------- emotion state ----------
-def _clamp(v: int, lo: int, hi: int) -> int:
-    return max(lo, min(hi, int(v)))
-
-def ensure_emotion(user_id: str):
-    con = sqlite3.connect(DB_PATH)
-    cur = con.cursor()
-    cur.execute("INSERT OR IGNORE INTO emotion_state (user_id) VALUES (?)", (user_id,))
-    con.commit()
-    con.close()
-
-def get_emotion(user_id: str):
-    ensure_emotion(user_id)
-    con = sqlite3.connect(DB_PATH)
-    cur = con.cursor()
-    cur.execute("SELECT valence, arousal, trust, last_tag FROM emotion_state WHERE user_id=?", (user_id,))
-    row = cur.fetchone()
-    con.close()
-    if not row:
-        return (0, 20, 20, "neutral")
-    return (int(row[0]), int(row[1]), int(row[2]), row[3])
-
-def set_emotion(user_id: str, valence: int, arousal: int, trust: int, last_tag: str):
-    ensure_emotion(user_id)
-    con = sqlite3.connect(DB_PATH)
-    cur = con.cursor()
+def increment_daily_count(user_id: str, ymd: str):
+    init_db()
+    conn = _conn()
+    cur = conn.cursor()
     cur.execute("""
-        UPDATE emotion_state
-        SET valence=?, arousal=?, trust=?, last_tag=?
-        WHERE user_id=?
-    """, (int(valence), int(arousal), int(trust), str(last_tag), user_id))
-    con.commit()
-    con.close()
+    INSERT INTO daily_counts(user_id, ymd, count) VALUES(?, ?, 1)
+    ON CONFLICT(user_id, ymd) DO UPDATE SET count = count + 1
+    """, (str(user_id), ymd))
+    conn.commit()
+    conn.close()
 
-def update_emotion_by_text(user_id: str, text: str, chichi: bool = False):
-    """
-    ざっくりルールベースで感情を動かす。
-    ※モデルに解析させるより安全＆安定（コスト0）
-    """
-    v, a, t, last = get_emotion(user_id)
-    s = (text or "").strip()
+# ---------- Channel messages ----------
+def add_channel_message(channel_id: str, author_id: str, content: str):
+    init_db()
+    conn = _conn()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO channel_messages(channel_id, author_id, content) VALUES(?, ?, ?)",
+        (str(channel_id), str(author_id), str(content))
+    )
+    conn.commit()
+    conn.close()
 
-    # ベース減衰：時間は見てないので “発言ごと” に少し落ち着く
-    a = _clamp(a - 2, 0, 100)
+def get_recent_messages(channel_id: str, limit: int = 12):
+    init_db()
+    conn = _conn()
+    cur = conn.cursor()
+    cur.execute("""
+    SELECT author_id, content
+    FROM channel_messages
+    WHERE channel_id=?
+    ORDER BY ts DESC
+    LIMIT ?
+    """, (str(channel_id), int(limit)))
+    rows = cur.fetchall()
+    conn.close()
+    rows.reverse()
+    return [(r[0], r[1]) for r in rows]
 
-    # ポジ/ネガ
-    pos = ["ありがとう", "好き", "大好き", "嬉しい", "楽しい", "最高", "助かった", "えへへ", "✨", "😊", "かわいい", "すごい"]
-    neg = ["つらい", "しんどい", "悲しい", "寂しい", "むり", "無理", "最悪", "泣", "もうだめ", "疲れた", "怒", "ムカつく"]
+# ---------- KV ----------
+def _kv_get(user_id: str, key: str):
+    init_db()
+    conn = _conn()
+    cur = conn.cursor()
+    cur.execute("SELECT value FROM user_kv WHERE user_id=? AND key=?", (str(user_id), str(key)))
+    row = cur.fetchone()
+    conn.close()
+    return row[0] if row else None
 
-    if any(k in s for k in pos):
-        v += 10
-        a += 6
-        t += 3
-    if any(k in s for k in neg):
-        v -= 12
-        a += 8
-        t -= 2
+def _kv_set(user_id: str, key: str, value: str):
+    init_db()
+    conn = _conn()
+    cur = conn.cursor()
+    cur.execute("""
+    INSERT INTO user_kv(user_id, key, value) VALUES(?, ?, ?)
+    ON CONFLICT(user_id, key) DO UPDATE SET value=excluded.value
+    """, (str(user_id), str(key), str(value)))
+    conn.commit()
+    conn.close()
 
-    # 距離感（信頼）
-    close = ["会いたい", "ぎゅ", "だいすき", "愛して", "甘えたい", "恋", "一緒"]
-    if any(k in s for k in close):
-        t += 6
-        a += 4
-        v += 4
+def get_last_morning_greet_date(user_id: str):
+    return _kv_get(user_id, "last_morning_greet_date")
 
-    # 疑問多め→会話モードで少しarousal上げる
-    if "?" in s or "？" in s:
-        a += 2
+def set_last_morning_greet_date(user_id: str, ymd: str):
+    _kv_set(user_id, "last_morning_greet_date", ymd)
 
-    # ちちは少しだけ上振れ（特別扱い）
-    if chichi:
-        t += 1
+# ---------- Emotion ----------
+def _clamp(x, lo=-1.0, hi=1.0):
+    return max(lo, min(hi, x))
 
-    v = _clamp(v, -100, 100)
-    a = _clamp(a, 0, 100)
-    t = _clamp(t, 0, 100)
-
-    tag = emotion_tag(v, a, t)
-    set_emotion(user_id, v, a, t, tag)
-    return (v, a, t, tag)
-
-def emotion_tag(valence: int, arousal: int, trust: int) -> str:
-    """
-    数値→タグ
-    """
-    if valence <= -30 and arousal >= 55:
-        return "upset"      # 怒り/イライラ
-    if valence <= -25 and arousal < 55:
-        return "sad"        # 落ち込み
-    if valence >= 35 and arousal >= 55:
-        return "excited"    # はしゃぎ
-    if valence >= 30 and arousal < 55:
-        return "happy"      # うれしい
-    if trust >= 70 and valence >= 10:
-        return "affectionate"  # 甘え/親密
-    if arousal <= 20:
-        return "calm"       # 落ち着き
+def _tag_from_state(v, a, t):
+    # 雑だけど「それっぽい」タグにする
+    if t > 0.55 and v > 0.15:
+        return "affectionate"
+    if v > 0.35 and a > 0.1:
+        return "excited"
+    if v > 0.25:
+        return "happy"
+    if v < -0.35 and a > 0.1:
+        return "upset"
+    if v < -0.25:
+        return "sad"
+    if abs(v) < 0.15 and a < 0.15:
+        return "calm"
     return "neutral"
+
+def _load_emotion(user_id: str):
+    init_db()
+    conn = _conn()
+    cur = conn.cursor()
+    cur.execute("SELECT valence, arousal, tone, tag FROM user_emotion WHERE user_id=?", (str(user_id),))
+    row = cur.fetchone()
+    if not row:
+        # 初期
+        conn.close()
+        return 0.0, 0.0, 0.0, "neutral"
+    conn.close()
+    return float(row[0]), float(row[1]), float(row[2]), str(row[3])
+
+def _save_emotion(user_id: str, v: float, a: float, t: float, tag: str):
+    init_db()
+    conn = _conn()
+    cur = conn.cursor()
+    cur.execute("""
+    INSERT INTO user_emotion(user_id, valence, arousal, tone, tag) VALUES(?, ?, ?, ?, ?)
+    ON CONFLICT(user_id) DO UPDATE SET
+        valence=excluded.valence,
+        arousal=excluded.arousal,
+        tone=excluded.tone,
+        tag=excluded.tag
+    """, (str(user_id), float(v), float(a), float(t), str(tag)))
+    conn.commit()
+    conn.close()
+
+def update_emotion_by_text(user_id: str, text: str, chichi: bool):
+    """
+    雑な感情推定で、ユーザーごとの感情ステートを更新して返す。
+    return: (valence, arousal, tone, tag)
+    """
+    v, a, t, _ = _load_emotion(user_id)
+
+    s = (text or "")
+    s_lower = s.lower()
+
+    # デフォルトはちょい減衰（落ち着いていく）
+    v *= 0.92
+    a *= 0.90
+    t *= 0.94
+
+    # ポジネガ
+    pos = ["好き", "すき", "かわいい", "可愛い", "ありがとう", "ありがと", "最高", "嬉", "うれしい", "えらい", "天才", "神"]
+    neg = ["つらい", "辛い", "しんどい", "むり", "無理", "最悪", "きらい", "嫌い", "うざ", "腹立", "むかつく", "泣"]
+    excite = ["！", "!", "www", "笑", "やば", "すご", "最高"]
+    calm = ["ふぅ", "落ち着", "まったり", "のんびり", "眠", "ねむ", "ねむい"]
+    affection = ["ぎゅ", "ちゅ", "だいすき", "大好き", "会いたい", "寂", "さみしい", "すきすき"]
+
+    if any(w in s for w in pos):
+        v += 0.25
+        a += 0.10
+    if any(w in s for w in neg):
+        v -= 0.28
+        a += 0.15
+    if any(w in s for w in calm):
+        a -= 0.10
+    if any(w in s for w in affection):
+        t += 0.22
+        v += 0.10
+
+    if any(w in s for w in excite):
+        a += 0.12
+
+    # ちち補正：少しだけ甘さが上がりやすい
+    if chichi:
+        t += 0.06
+        v += 0.03
+
+    v = _clamp(v)
+    a = _clamp(a)
+    t = _clamp(t)
+
+    tag = _tag_from_state(v, a, t)
+    _save_emotion(user_id, v, a, t, tag)
+    return v, a, t, tag
