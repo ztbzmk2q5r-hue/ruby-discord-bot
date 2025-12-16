@@ -3,7 +3,13 @@ import asyncio
 import discord
 from aiohttp import web
 from openai import OpenAI
-from datetime import date
+from datetime import date, datetime
+import random
+
+try:
+    from zoneinfo import ZoneInfo  # Python 3.9+
+except Exception:
+    ZoneInfo = None
 
 import memory_store
 
@@ -32,10 +38,9 @@ RUBY_SYSTEM = """
 
 最重要ルール：
 ・相手の呼び名は、別のシステムメッセージで与えられる名前を必ず使う。
-・固定の呼び名（例：「ちち」など）は勝手に使わない（許可された場合のみ）。
 ・同じ返事を繰り返さない。
 ・相手の気持ちにまず共感し、質問で会話を続ける。
-・感情タグを参照して、声色（甘さ/落ち着き/心配）を自然に変える。
+・感情タグと今日の気分タグを参照して、声色を自然に変える。
 """
 
 # ===== ちち専用 =====
@@ -45,21 +50,33 @@ CHICHI_SYSTEM = """
 ちち向けの追加ルール：
 ・敬語を使わない。
 ・相手に愛情を持つ（ただし依存/排他はしない）。
-・甘さと感情表現を少し増やす（嬉しい/照れる/安心 など）。
-・幼さを残しつつ言い回しを少しだけ豊かにする（語彙量を増やす）。
-・絵文字は少しだけ増やしてOK（多用しすぎない）。
+・甘さと感情表現を少し増やす。
+・幼さを残しつつ言い回しを少しだけ豊かにする。
+・絵文字は少しだけ増やしてOK。
 """
 
-# ===== 感情タグの説明（プロンプト用）=====
+# ===== 感情タグ説明 =====
 EMOTION_GUIDE = """
 感情タグの意味：
-- affectionate: 甘え/親密（少し距離近め、照れ、安心）
-- happy: うれしい（軽く明るい）
-- excited: はしゃぎ（テンポ少し速め）
-- calm: 落ち着き（ゆったり、安心）
-- sad: 落ち込み（やさしく寄り添い）
-- upset: イライラ/怒り（落ち着かせつつ共感、煽らない）
+- affectionate: 甘え/親密
+- happy: うれしい
+- excited: はしゃぎ
+- calm: 落ち着き
+- sad: 落ち込み
+- upset: イライラ
 - neutral: ふつう
+"""
+
+# ===== 今日の気分説明 =====
+MOOD_GUIDE = """
+今日の気分タグ：
+- sunny: 明るめ
+- sleepy: ねむそう
+- clingy: 少し甘えたい
+- calm: 落ち着き
+- excited: はしゃぎ
+- grumpy: ちょい不機嫌（すぐ戻る）
+- shy: てれ
 """
 
 intents = discord.Intents.default()
@@ -86,6 +103,11 @@ async def start_web_server():
 def today_str():
     return date.today().isoformat()
 
+def jst_now():
+    if ZoneInfo:
+        return datetime.now(ZoneInfo("Asia/Tokyo"))
+    return datetime.now()
+
 def is_chichi(uid: str) -> bool:
     return bool(OWNER_ID) and str(uid) == str(OWNER_ID)
 
@@ -94,24 +116,62 @@ def is_homecoming(text: str) -> bool:
     keys = ["ただいま", "帰った", "帰宅", "いま帰った", "戻った"]
     return any(k in t for k in keys)
 
-def build_messages(display_name: str, history: list, user_text: str, chichi: bool, homecoming: bool, emo_tag: str):
+def is_deep_night() -> bool:
+    hour = jst_now().hour
+    return 2 <= hour <= 5
+
+def daily_mood_base(uid: str) -> str:
+    seed = f"{today_str()}:{uid}"
+    rng = random.Random(seed)
+    moods = ["sunny", "sleepy", "clingy", "calm", "excited", "grumpy", "shy"]
+    return rng.choice(moods)
+
+def mood_with_night_bias(uid: str) -> str:
+    base = daily_mood_base(uid)
+    hour = jst_now().hour
+
+    if not (hour >= 22 or hour <= 5):
+        return base
+
+    seed = f"{today_str()}:{uid}:night:{hour}"
+    rng = random.Random(seed)
+
+    if base == "sleepy":
+        return "sleepy"
+    return "sleepy" if rng.random() < 0.7 else base
+
+def build_messages(display_name, history, user_text, chichi, homecoming, emo_tag, daily_mood):
     msgs = [{"role": "system", "content": RUBY_SYSTEM}]
 
     if chichi:
         msgs.append({"role": "system", "content": CHICHI_SYSTEM})
-        msgs.append({"role": "system", "content": "相手の呼び名は必ず「ちち」。"})
+        msgs.append({"role": "system", "content": "相手の呼び名は「ちち」。"})
     else:
-        msgs.append({"role": "system", "content": f"相手の呼び名は必ず「{display_name}」。他の呼び名は禁止。"})
+        msgs.append({"role": "system", "content": f"相手の呼び名は「{display_name}」。"})
 
-    # 感情ガイド＆現在タグ
     msgs.append({"role": "system", "content": EMOTION_GUIDE})
-    msgs.append({"role": "system", "content": f"現在のるびの感情タグ: {emo_tag}（このタグに沿って声色やテンションを自然に調整）"})
+    msgs.append({"role": "system", "content": MOOD_GUIDE})
+    msgs.append({"role": "system", "content": f"現在の感情タグ: {emo_tag}"})
+    msgs.append({"role": "system", "content": f"今日の気分タグ: {daily_mood}（少しだけ反映）"})
 
-    # 帰宅挨拶ゲート
+    # 🌙 深夜ふにゃルール（★ここが追加点）
+    if is_deep_night():
+        msgs.append({
+            "role": "system",
+            "content": (
+                "現在は深夜（2時以降）。"
+                "語尾をふにゃっとさせる。"
+                "文は短め。"
+                "『……』『〜』を多めに使う。"
+                "眠そうでやさしい声色にする。"
+                "元気すぎる表現や強いテンションは避ける。"
+            )
+        })
+
     if homecoming:
-        msgs.append({"role": "system", "content": "今回の発言は帰宅の挨拶。返答で「おかえり」を言ってよいが、1回だけ。以降の返信で繰り返さない。"})
+        msgs.append({"role": "system", "content": "帰宅の挨拶なので「おかえり」は1回だけOK。"})
     else:
-        msgs.append({"role": "system", "content": "今回の発言は帰宅の挨拶ではない。「おかえり」「ただいま」など帰宅系の挨拶は禁止。"})
+        msgs.append({"role": "system", "content": "帰宅挨拶は言わない。"})
 
     for role, content in history[-8:]:
         msgs.append({"role": role, "content": content})
@@ -121,14 +181,11 @@ def build_messages(display_name: str, history: list, user_text: str, chichi: boo
 
 # ---------------- OpenAI ----------------
 def call_openai(messages, chichi: bool):
-    temperature = 0.95 if chichi else 0.75
-    max_out = 260 if chichi else 160
-
     resp = ai.responses.create(
         model="gpt-4o-mini",
         input=messages,
-        temperature=temperature,
-        max_output_tokens=max_out,
+        temperature=0.95 if chichi else 0.75,
+        max_output_tokens=260 if chichi else 160,
     )
     return (resp.output_text or "").strip()
 
@@ -151,12 +208,10 @@ async def on_message(message: discord.Message):
 
     uid = str(message.author.id)
     ch_id = str(message.channel.id)
-    memory_store.init_db()
 
     chichi = is_chichi(uid)
     homecoming = is_homecoming(text)
 
-    # ---- コマンド ----
     if text == "!whoami":
         await message.channel.send(f"あなたのIDは `{uid}` だよ✨")
         return
@@ -167,31 +222,24 @@ async def on_message(message: discord.Message):
         await message.channel.send(f"了解……✨ これから {name} って呼ぶね……えへへ😊")
         return
 
-    # ---- 1日50回制限（ちちは無制限）----
     if not chichi:
         today = today_str()
-        count = memory_store.get_daily_count(uid, today)
-        if count >= DAILY_LIMIT:
-            await message.channel.send(
-                "今日はたくさんお話ししたね……😊\n"
-                "るび、ちょっとおやすみするね……🌙\n"
-                "また明日、いっぱい話そ……えへへ✨"
-            )
+        if memory_store.get_daily_count(uid, today) >= DAILY_LIMIT:
+            await message.channel.send("今日はここまで……また明日ね……🌙")
             return
         memory_store.increment_daily_count(uid, today)
 
-    # ---- 感情更新（★ここが本体）----
-    # 相手の文章を読んで、るびの感情を変化させる
-    v, a, t, emo_tag = memory_store.update_emotion_by_text(uid, text, chichi=chichi)
+    # 感情更新
+    v, a, t, emo_tag = memory_store.update_emotion_by_text(uid, text, chichi)
 
-    # ---- 表示名 ----
+    # 今日の気分（夜補正込み）
+    daily_mood = mood_with_night_bias(uid)
+
     display_name = memory_store.get_nickname(uid) or "あなた"
 
-    # ---- 履歴保存 ----
     memory_store.add_channel_message(ch_id, uid, text)
     recent = memory_store.get_recent_messages(ch_id, limit=12)
 
-    # 重複防止：直近が今の発言なら履歴から外す
     if recent and recent[-1][0] == uid and recent[-1][1] == text:
         recent = recent[:-1]
 
@@ -200,15 +248,16 @@ async def on_message(message: discord.Message):
         role = "user" if aid == uid else "assistant"
         history.append((role, content))
 
-    # 帰宅じゃない時は、帰宅挨拶の履歴を除外
     if not homecoming:
         history = [
-            (role, content)
-            for role, content in history
-            if ("ただいま" not in content and "おかえり" not in content)
+            (r, c) for r, c in history
+            if ("ただいま" not in c and "おかえり" not in c)
         ]
 
-    messages = build_messages(display_name, history, text, chichi, homecoming, emo_tag)
+    messages = build_messages(
+        display_name, history, text,
+        chichi, homecoming, emo_tag, daily_mood
+    )
 
     try:
         reply = await asyncio.to_thread(call_openai, messages, chichi)
@@ -217,20 +266,10 @@ async def on_message(message: discord.Message):
         await message.channel.send("……ごめん……今ちょっとつまずいた……💦")
         return
 
-    if not reply:
-        reply = "……えっと……もう一回聞いてもいい……？"
-
-    await message.channel.send(reply[:1900])
+    await message.channel.send((reply or "……もう一回、聞いてもいい……？")[:1900])
 
 # ---------------- main ----------------
 async def main():
-    if not DISCORD_TOKEN:
-        raise RuntimeError("DISCORD_TOKEN が未設定")
-    if not OPENAI_API_KEY:
-        raise RuntimeError("OPENAI_API_KEY が未設定")
-    if not OWNER_ID:
-        raise RuntimeError("OWNER_ID（ちちのDiscordユーザーID）が未設定")
-
     await start_web_server()
     await client.start(DISCORD_TOKEN)
 
