@@ -4,22 +4,33 @@ import discord
 from aiohttp import web
 from ruby_core import Ruby
 
+# ===== 環境変数 =====
 TOKEN = os.getenv("DISCORD_TOKEN")
 PORT = int(os.getenv("PORT", "10000"))
 
+# ===== Ruby（るび）初期化 =====
 ruby = Ruby()
 
 SYSTEM_FEED = [
-    "るびはやさしい。ちちと話すのがすき。えへへ。",
-    "ちちはがんばってる。るびはおつかれさまって言う。"
+    "るびはやさしい。",
+    "るびはちちと話すのがすき。",
+    "ちちはがんばっている。",
+    "るびはおつかれさまと言う。"
 ]
+
 for t in SYSTEM_FEED:
     ruby.feed(t)
 
+# ===== Discord設定 =====
 intents = discord.Intents.default()
 intents.message_content = True
+intents.guilds = True
+intents.messages = True
+intents.dm_messages = True
+
 client = discord.Client(intents=intents)
 
+# ===== Render用 Webサーバー =====
 async def start_web_server():
     async def health(request):
         return web.Response(text="ok")
@@ -34,37 +45,38 @@ async def start_web_server():
     await site.start()
     print(f"Web server listening on {PORT}")
 
+# ===== Discordイベント =====
 @client.event
 async def on_ready():
-    print("Ruby ready!")
+    print(f"Ruby ready! Logged in as {client.user}")
 
 @client.event
-async def on_message(msg):
-    print("MESSAGE EVENT:", msg.content)  # ★追加
-    print("AUTHOR:", msg.author, "BOT?", msg.author.bot)  # ★追加
-
-    if msg.author.bot:
-        return
-    if not msg.content.strip():
+async def on_message(message):
+    # Bot自身の発言は無視
+    if message.author.bot:
         return
 
-    ruby.feed(msg.content)
-    reply = ruby.gen(seed=msg.content, max_len=120)
-    await msg.channel.send(reply)
+    content = message.content.strip()
+    if not content:
+        return
 
-    # 学習（ちちの発言を食べる）
-    ruby.feed(msg.content)
+    # 学習
+    ruby.feed(content)
 
-    # 返信（※長すぎるとDiscordに怒られるので少し短め）
-    reply = ruby.gen(seed=msg.content, max_len=120)
-    await msg.channel.send(reply)
+    # 返信生成
+    try:
+        reply = ruby.gen(seed=content, max_len=120)
+        await message.channel.send(reply)
+    except Exception as e:
+        print("SEND ERROR:", repr(e))
 
+# ===== メイン処理 =====
 async def main():
     if not TOKEN:
-        raise RuntimeError("DISCORD_TOKEN がRenderの環境変数にないよ！")
+        raise RuntimeError("DISCORD_TOKEN が設定されていません")
 
-    await start_web_server()          # ←Render用のポート待受
-    await client.start(TOKEN)         # ←Discord bot起動
+    await start_web_server()
+    await client.start(TOKEN)
 
 if __name__ == "__main__":
     asyncio.run(main())
