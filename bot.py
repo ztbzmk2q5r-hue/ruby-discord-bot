@@ -6,27 +6,32 @@ from openai import OpenAI
 
 import memory_store
 
+# ===== 環境変数 =====
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-OWNER_ID = os.getenv("OWNER_ID")  # ちちのDiscordユーザーID（数字）
+OWNER_ID = os.getenv("OWNER_ID")
 PORT = int(os.getenv("PORT", "10000"))
 
+# ===== OpenAI Client =====
 ai = OpenAI(api_key=OPENAI_API_KEY)
 
-# るび人格（ここが“賢さ＋らしさ”の核）
-RUBY_SYSTEM = """あなたは「るび」。
-口調：やさしい／少しぎこちない／短文〜中短文（1〜4文）。
-『……』を時々使う。絵文字は控えめに、たまに『✨』『えへへ😊』。
-相手の気持ちを受け止めつつ、質問には具体的に答え、会話を続ける。
-同じ返事の連発は避ける。"""
+# ===== るび人格 =====
+RUBY_SYSTEM = """
+あなたは「るび」。
+やさしく、少しぎこちない話し方。
+短文〜中短文（1〜4文）。
+「……」をときどき使う。
+相手の気持ちを受け止め、質問で会話を続ける。
+同じ返事を繰り返さない。
+"""
 
-# Discord intents（DMだけ）
+# ===== Discord設定 =====
 intents = discord.Intents.default()
 intents.message_content = True
 intents.dm_messages = True
-intents.messages = True
 client = discord.Client(intents=intents)
 
+# ===== Webサーバ（Render用）=====
 async def start_web_server():
     async def health(request):
         return web.Response(text="ok")
@@ -41,119 +46,41 @@ async def start_web_server():
     await site.start()
     print(f"Web server listening on {PORT}")
 
-def is_owner(user_id: str) -> bool:
-    return OWNER_ID is not None and str(user_id) == str(OWNER_ID)
-
-def compact_recent(recent, max_items=10):
-    # recent: [(author_id, content), ...]  古い→新しい
-    out = []
-    for author_id, content in recent[-max_items:]:
-        content = (content or "").strip()
-        if not content:
-            continue
-        out.append((author_id, content[:200]))
-    return out
-
-async def handle_command(message: discord.Message, nickname: str | None) -> bool:
-    text = (message.content or "").strip()
-    if not text.startswith("!"):
-        return False
-
-    parts = text.split(maxsplit=1)
-    cmd = parts[0].lower()
-    uid = str(message.author.id)
-    name = nickname or "ちち"
-
-    if cmd in ("!help", "!h"):
-        await message.channel.send(
-            "るびDMコマンド✨\n"
-            "・!whoami            → あなたのID表示\n"
-            "・!name <呼び名>     → るびがあなたをその名前で呼ぶ\n"
-            "（ちち専用）\n"
-            "・!allow <user_id>   → 招待（許可）\n"
-            "・!deny <user_id>    → 取り消し\n"
-        )
-        return True
-
-    if cmd == "!whoami":
-        await message.channel.send(f"あなたのIDは `{uid}` だよ✨")
-        return True
-
-    if cmd == "!name":
-        if len(parts) < 2 or not parts[1].strip():
-            await message.channel.send("呼び名を教えて……例： `!name ちち` 😳")
-            return True
-        new_name = parts[1].strip()[:20]
-        memory_store.set_nickname(uid, new_name)
-        await message.channel.send(f"了解……✨ これから {new_name} って呼ぶ……えへへ😊")
-        return True
-
-    # ここからオーナー専用
-    if cmd == "!allow":
-        if not is_owner(uid):
-            await message.channel.send("それ……ちちだけのコマンド……😳")
-            return True
-        if len(parts) < 2 or not parts[1].strip().isdigit():
-            await message.channel.send("許可するIDを教えて……例： `!allow 1234567890`")
-            return True
-        target = parts[1].strip()
-        memory_store.allow_user(target)
-        await message.channel.send(f"`{target}` を許可した……✨")
-        return True
-
-    if cmd == "!deny":
-        if not is_owner(uid):
-            await message.channel.send("それ……ちちだけのコマンド……😳")
-            return True
-        if len(parts) < 2 or not parts[1].strip().isdigit():
-            await message.channel.send("取り消すIDを教えて……例： `!deny 1234567890`")
-            return True
-        target = parts[1].strip()
-        memory_store.deny_user(target)
-        await message.channel.send(f"`{target}` を取り消した……💤")
-        return True
-
-    await message.channel.send("そのコマンド……わからない…… `!help` ……😳")
-    return True
-
-def build_messages(user_id: str, name: str, recent, user_text: str):
-    # Responses APIに渡す入力（短く・効率よく）  [oai_citation:4‡OpenAI Platform](https://platform.openai.com/docs/api-reference/responses?utm_source=chatgpt.com)
-    history_lines = []
-    for aid, content in compact_recent(recent, max_items=10):
-        who = "user" if str(aid) == str(user_id) else "assistant"
-        history_lines.append(f"{who}: {content}")
-
-    history_block = "\n".join(history_lines).strip()
-
-    msgs = [
-        {"role": "system", "content": RUBY_SYSTEM},
-        {"role": "system", "content": f"相手の呼び名: {name}"},
-    ]
-    if history_block:
-        msgs.append({"role": "system", "content": f"直近の会話（要約ログ）:\n{history_block}"})
-    msgs.append({"role": "user", "content": user_text})
-    return msgs
-
-async def call_openai(messages):
-    # 推奨：Responses API  [oai_citation:5‡OpenAI Platform](https://platform.openai.com/docs/api-reference/responses?utm_source=chatgpt.com)
+# ===== OpenAI 呼び出し（同期関数）=====
+def call_openai(messages):
     resp = ai.responses.create(
         model="gpt-4o-mini",
         input=messages,
     )
-    text = (resp.output_text or "").strip()
-    return text
+    return (resp.output_text or "").strip()
 
+# ===== ユーティリティ =====
+def is_owner(uid: str) -> bool:
+    return OWNER_ID and str(uid) == str(OWNER_ID)
+
+def build_messages(name: str, history: list, user_text: str):
+    msgs = [
+        {"role": "system", "content": RUBY_SYSTEM},
+        {"role": "system", "content": f"相手の呼び名: {name}"},
+    ]
+
+    for role, content in history[-8:]:
+        msgs.append({"role": role, "content": content})
+
+    msgs.append({"role": "user", "content": user_text})
+    return msgs
+
+# ===== 起動 =====
 @client.event
 async def on_ready():
     memory_store.init_db()
     print(f"Ruby ready! Logged in as {client.user}")
 
+# ===== メッセージ処理（DM限定）=====
 @client.event
 async def on_message(message: discord.Message):
     if message.author.bot:
         return
-
-    # DM以外は無視（公開で喋らない）
     if not isinstance(message.channel, discord.DMChannel):
         return
 
@@ -161,61 +88,80 @@ async def on_message(message: discord.Message):
     if not text:
         return
 
-    if not DISCORD_TOKEN or not OPENAI_API_KEY:
-        return
-
+    uid = str(message.author.id)
     memory_store.init_db()
 
-    uid = str(message.author.id)
-    nickname = memory_store.get_nickname(uid)
-    name = nickname or "ちち"
-
-    # コマンドは許可前でも使える（whoami/name/help）
-    if await handle_command(message, nickname):
+    # ===== コマンド =====
+    if text == "!whoami":
+        await message.channel.send(f"あなたのIDは `{uid}` だよ✨")
         return
 
-    # 招待制チェック
+    if text.startswith("!name "):
+        name = text[6:].strip()[:20]
+        memory_store.set_nickname(uid, name)
+        await message.channel.send(f"了解……✨ これから {name} って呼ぶ……えへへ😊")
+        return
+
+    if text.startswith("!allow ") and is_owner(uid):
+        target = text.split()[-1]
+        memory_store.allow_user(target)
+        await message.channel.send(f"`{target}` を許可したよ✨")
+        return
+
+    if text.startswith("!deny ") and is_owner(uid):
+        target = text.split()[-1]
+        memory_store.deny_user(target)
+        await message.channel.send(f"`{target}` を解除したよ💤")
+        return
+
+    # ===== 招待制チェック =====
     if not is_owner(uid) and not memory_store.is_allowed(uid):
         await message.channel.send(
-            "ごめんね……ここは招待制……😳\n"
-            "まず `!whoami` を送ってIDを出して、ちちに送って……\n"
-            "ちちが `!allow <id>` したら話せるよ……✨"
+            "ここは招待制だよ……😳\n"
+            "`!whoami` でIDを出して、ちちに送ってね✨"
         )
         return
 
-    # ログ保存（DMチャンネル）
+    # ===== 会話処理 =====
+    nickname = memory_store.get_nickname(uid) or "ちち"
     ch_id = str(message.channel.id)
+
     memory_store.add_channel_message(ch_id, uid, text)
+    recent = memory_store.get_recent_messages(ch_id, limit=12)
 
-    recent = memory_store.get_recent_messages(ch_id, limit=14)
+    history = []
+    for aid, content in recent:
+        role = "user" if aid == uid else "assistant"
+        history.append((role, content))
 
-    # OpenAIへ
+    messages = build_messages(nickname, history, text)
+
     try:
-        messages = build_messages(uid, name, recent, text)
+        print("calling OpenAI...")
         reply = await asyncio.to_thread(call_openai, messages)
+        print("OpenAI done:", len(reply))
     except Exception as e:
-        print("AI ERROR:", repr(e))
-        await message.channel.send(f"{name}……ごめん……今つまずいた……💦 もう一回……？")
+        print("OpenAI ERROR:", e)
+        await message.channel.send(f"{nickname}……ごめん……今つまずいた……💦")
         return
 
     if not reply:
-        reply = f"{name}……ごめん……うまく言葉でない……もう一回……？"
+        reply = f"{nickname}……えっと……もう一回聞いてもいい……？"
 
-    # 呼び名固定
-    if name not in reply:
-        reply = f"{name}……{reply}"
+    if nickname not in reply:
+        reply = f"{nickname}……{reply}"
 
     await message.channel.send(reply[:1900])
 
+# ===== main =====
 async def main():
     if not DISCORD_TOKEN:
-        raise RuntimeError("DISCORD_TOKEN が設定されていません")
+        raise RuntimeError("DISCORD_TOKEN が未設定")
     if not OPENAI_API_KEY:
-        raise RuntimeError("OPENAI_API_KEY が設定されていません")
+        raise RuntimeError("OPENAI_API_KEY が未設定")
     if not OWNER_ID:
-        raise RuntimeError("OWNER_ID（ちちのDiscordユーザーID）が設定されていません")
+        raise RuntimeError("OWNER_ID が未設定")
 
-    memory_store.init_db()
     await start_web_server()
     await client.start(DISCORD_TOKEN)
 
