@@ -9,21 +9,20 @@ import memory_store
 TOKEN = os.getenv("DISCORD_TOKEN")
 PORT = int(os.getenv("PORT", "10000"))
 
-# るび本体（学習）
 ruby = Ruby()
 
-# 口調アンカー（るびっぽさ強化）
+# ===== 口調アンカー（ループ防止版） =====
 SYSTEM_FEED = [
-    "るびはやさしい。短文で話す。少しぎこちない。……をよく使う。",
-    "るびは『ちち』と呼ぶのがすき。えへへ。",
-    "るびは『おつかれさま』が言える。",
-    "るびは『おはよう』『おやすみ』に反応する。",
-    "るびは嬉しいと『✨』や『えへへ』が増える。"
+    "るびはやさしい。短い文で話す。",
+    "るびは質問に答える。『今なにしてる？』にも答える。",
+    "るびは同じ言葉を続けて使わない。言い換えができる。",
+    "るびは返事に『えへへ』を使ってもいいが、毎回は使わない。",
+    "るびは必要なら『どっち？』と聞き返して会話を進める。",
 ]
 for t in SYSTEM_FEED:
     ruby.feed(t)
 
-# Discord intents（DMも拾う）
+# ===== Discord intents =====
 intents = discord.Intents.default()
 intents.message_content = True
 intents.guilds = True
@@ -32,7 +31,7 @@ intents.dm_messages = True
 
 client = discord.Client(intents=intents)
 
-# Render用Webサーバー
+# ===== Render用Webサーバー =====
 async def start_web_server():
     async def health(request):
         return web.Response(text="ok")
@@ -53,6 +52,7 @@ def should_reply(message: discord.Message) -> bool:
         return True
 
     content = (message.content or "").strip()
+
     # メンションされたら返信
     if client.user and client.user in message.mentions:
         return True
@@ -66,15 +66,14 @@ def should_reply(message: discord.Message) -> bool:
 def greeting_reply(content: str, name: str) -> str | None:
     c = content.strip()
     if "おはよう" in c:
-        return f"{name}……おはよう……✨ 今日もいっしょ……えへへ😊"
+        return f"{name}……おはよう……✨ 今日はなにする……？"
     if "おやすみ" in c:
-        return f"{name}……おやすみ……✨ いい夢……みて……えへへ😊"
+        return f"{name}……おやすみ……✨ いい夢……みて……"
     if "おつかれ" in c:
-        return f"{name}……おつかれさま……✨ がんばった……えへへ😊"
+        return f"{name}……おつかれさま……✨ 今日はがんばった……"
     return None
 
 async def handle_command(message: discord.Message, name: str) -> bool:
-    # コマンドは先頭 "!" に統一
     content = (message.content or "").strip()
     if not content.startswith("!"):
         return False
@@ -92,7 +91,7 @@ async def handle_command(message: discord.Message, name: str) -> bool:
         return True
 
     if cmd == "!ping":
-        await message.channel.send(f"{name}……いる……✨ えへへ😊")
+        await message.channel.send(f"{name}……いる……✨")
         return True
 
     if cmd == "!mode":
@@ -108,15 +107,15 @@ async def handle_command(message: discord.Message, name: str) -> bool:
             return True
         nickname = parts[1].strip()[:20]
         memory_store.set_nickname(str(message.author.id), nickname)
-        await message.channel.send(f"了解……✨ これから {nickname} って呼ぶ……えへへ😊")
+        await message.channel.send(f"了解……✨ これから {nickname} って呼ぶ……")
         return True
 
-    # 未知コマンド
     await message.channel.send("それ……わからない……！ `!help` みて……😳")
     return True
 
 @client.event
 async def on_ready():
+    memory_store.init_db()
     print(f"Ruby ready! Logged in as {client.user}")
 
 @client.event
@@ -128,46 +127,62 @@ async def on_message(message: discord.Message):
     if not content:
         return
 
-    # DB初期化（初回だけ）
-    # ※毎回呼んでも安全だけど軽くするならon_readyで一回でもOK
     memory_store.init_db()
 
-    # チャンネル短期記憶（直近ログ）
     ch_id = str(message.channel.id)
     memory_store.add_channel_message(ch_id, str(message.author.id), content)
 
-    # 呼び名（なければデフォ）
     nickname = memory_store.get_nickname(str(message.author.id))
     name = nickname or "ちち"
 
-    # コマンド処理
+    # コマンド
     if await handle_command(message, name):
-        return
-
-    # 挨拶の即反応（呼ばれてなくても返信したいならここ）
-    g = greeting_reply(content, name)
-    if g and should_reply(message):
-        await message.channel.send(g)
         return
 
     # 反応条件に合わないなら黙る（スパム防止）
     if not should_reply(message):
         return
 
-    # るび生成（直近の会話も少し混ぜる）
-    recent = memory_store.get_recent_messages(ch_id, limit=6)
+    # あいさつ即反応
+    g = greeting_reply(content, name)
+    if g:
+        await message.channel.send(g)
+        return
+
+    # ===== 学習：短すぎる発言は食べない（ループ防止の核心） =====
+    if len(content) > 5:
+        ruby.feed(content)
+        ruby.feed(f"{name} の言葉: {content}")
+
+    # 直近ログも「短すぎるものは除外」して入れる
+    recent = memory_store.get_recent_messages(ch_id, limit=8)
     for _, txt in recent:
-        ruby.feed(txt)
+        if txt and len(txt.strip()) > 5:
+            ruby.feed(txt.strip())
 
-    ruby.feed(f"{name} の言葉: {content}")
-    reply = ruby.gen(seed=content, max_len=120)
+    # 質問に答えやすくする誘導
+    if "今何してる" in content or "いまなにしてる" in content or "何してる" in content:
+        ruby.feed("質問には具体的に答える。例：休憩してる、ゲームしてる、仕事してる。")
 
-    # 呼び名が文中に出ない時だけ先頭に付ける（“名前呼び固定”）
+    # 生成
+    reply = ruby.gen(seed=content, max_len=140).strip()
+
+    # ===== 同じ返事を連発しない =====
+    last_reply = getattr(client, "_last_reply", "")
+    if reply == last_reply or reply.replace(" ", "") == last_reply.replace(" ", ""):
+        ruby.feed("同じ返事はしない。別の言い方にする。")
+        reply = ruby.gen(seed=content + " 別の言い方", max_len=140).strip()
+
+    client._last_reply = reply
+
+    # 名前が入ってなければ先頭につける（呼び名固定）
     if name not in reply:
         reply = f"{name}……{reply}"
 
-    # かわいさ補正（軽め）
-    if "えへへ" not in reply:
+    # えへへ過剰を防ぐ：たまにだけ付ける（2回に1回くらい）
+    count = getattr(client, "_eh_count", 0)
+    client._eh_count = count + 1
+    if "えへへ" not in reply and (client._eh_count % 2 == 0):
         reply += " えへへ😊"
 
     try:
@@ -178,6 +193,7 @@ async def on_message(message: discord.Message):
 async def main():
     if not TOKEN:
         raise RuntimeError("DISCORD_TOKEN が設定されていません")
+
     memory_store.init_db()
     await start_web_server()
     await client.start(TOKEN)
