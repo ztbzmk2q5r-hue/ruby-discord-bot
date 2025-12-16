@@ -1,118 +1,167 @@
 import os
 import asyncio
+import random
+import re
 import discord
 from aiohttp import web
 
-from ruby_core import Ruby
 import memory_store
 
-TOKEN = os.getenv("DISCORD_TOKEN")
+DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 PORT = int(os.getenv("PORT", "10000"))
 
-ruby = Ruby()
-
-# ===== 口調アンカー（ループ防止版） =====
-SYSTEM_FEED = [
-    "るびはやさしい。いっぱい話す。",
-    "るびは質問に答える。『今なにしてる？』にも答える。",
-    "るびは同じ言葉を続けて使わない。言い換えができる。",
-    "るびは返事に『えへへ』を使ってもいいが、毎回は使わない。",
-    "るびは必要なら『どっち？』と聞き返して会話を進める。",
-]
-for t in SYSTEM_FEED:
-    ruby.feed(t)
-
-# ===== Discord intents =====
+# --- Discord intents ---
 intents = discord.Intents.default()
 intents.message_content = True
-intents.guilds = True
-intents.messages = True
 intents.dm_messages = True
-
+intents.messages = True
 client = discord.Client(intents=intents)
 
-# ===== Render用Webサーバー =====
+# --- Render用Web ---
 async def start_web_server():
     async def health(request):
         return web.Response(text="ok")
-
     app = web.Application()
     app.router.add_get("/", health)
     app.router.add_get("/healthz", health)
-
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
     print(f"Web server listening on {PORT}")
 
-def should_reply(message: discord.Message) -> bool:
-    # DMは常に返信
-    if isinstance(message.channel, discord.DMChannel):
-        return True
+# --- るびの“思考エンジン”（無料で賢く見せる核）---
+THOUGHTS = [
+    "それって、今の気分が大事なやつ……だと思う……",
+    "たぶんね、焦らない方がうまくいく……",
+    "それ、選ぶ基準を一個決めると楽……",
+    "いま必要なのは、答えより『次の一手』かも……",
+    "うーん……気持ちを守る選び方がよさそう……",
+]
 
-    content = (message.content or "").strip()
+FOLLOWUPS = [
+    "いま、どっち寄り……？",
+    "それで、いちばん困ってるのはどこ……？",
+    "理想はどうなったら嬉しい……？",
+    "いまの気分、10段階だといくつ……？",
+]
 
-    # メンションされたら返信
-    if client.user and client.user in message.mentions:
-        return True
+EMOJI = ["", "✨", "…", ""]
 
-    # 「るび」で呼ばれたら返信（ゆるく）
-    if content.startswith("るび") or content.startswith("ルビ"):
-        return True
+def norm(text: str) -> str:
+    return re.sub(r"\s+", " ", (text or "")).strip()
 
-    return False
-
-def greeting_reply(content: str, name: str) -> str | None:
-    c = content.strip()
-    if "おはよう" in c:
-        return f"{name}……おはよう……✨ 今日はなにする……？"
-    if "おやすみ" in c:
-        return f"{name}……おやすみ……✨ いい夢……みて……"
-    if "おつかれ" in c:
-        return f"{name}……おつかれさま……✨ 今日はがんばった……"
+def is_greeting(t: str):
+    if "おはよう" in t: return "おはよう"
+    if "おやすみ" in t: return "おやすみ"
+    if "おつかれ" in t: return "おつかれ"
     return None
 
+def is_question(t: str) -> bool:
+    return ("?" in t) or ("？" in t) or any(x in t for x in ["なに", "何", "どれ", "どっち", "いつ", "どこ", "だれ", "誰", "どう", "なんで", "理由"])
+
+def detect_choice(t: str):
+    # 「AかB」「AとBどっち」みたいな簡易検出
+    if "どっち" in t and ("と" in t or "、" in t):
+        # 例: 寿司と焼肉どっち
+        m = re.search(r"(.+?)と(.+?)どっち", t)
+        if m:
+            a = m.group(1)[-10:].strip(" 、")
+            b = m.group(2)[:10].strip(" 、")
+            return a, b
+    if "か" in t and len(t) <= 40:
+        parts = [p.strip(" 、") for p in t.split("か") if p.strip()]
+        if len(parts) == 2:
+            return parts[0][-10:], parts[1][:10]
+    return None
+
+def make_reply(name: str, user_text: str, note: str | None, recent: list[tuple[str,str]]) -> str:
+    t = norm(user_text)
+
+    # 1) 挨拶は即レス（でも一言“考え”も混ぜる）
+    g = is_greeting(t)
+    if g == "おはよう":
+        return f"{name}……おはよう{random.choice(['', '✨'])} 今日は『最初の一手』を小さくすると勝てる……"
+    if g == "おやすみ":
+        return f"{name}……おやすみ……✨ 今日はよく耐えた……えらい……"
+    if g == "おつかれ":
+        return f"{name}……おつかれさま……✨ 休むのも作業のうち……"
+
+    # 2) 選択肢系は、基準を提案して選ばせる（賢さ出る）
+    ch = detect_choice(t)
+    if ch:
+        a, b = ch
+        thought = random.choice([
+            f"私はね……『後悔しない方』がいい……",
+            f"直感が強い方……たぶん正解……",
+            f"今日の体力に優しい方……がいい……",
+        ])
+        return f"{name}……{a} と {b} なら……{thought} {random.choice(FOLLOWUPS)}"
+
+    # 3) 質問には「答える＋ひとこと考え＋質問返し」
+    if is_question(t):
+        thought = random.choice(THOUGHTS)
+        # “答え”はテンプレで薄く（無料で破綻しない）
+        base = "うーん……いまの情報だけだと断定はできない……でも……"
+        # noteがあれば賢さとして少し混ぜる
+        note_hint = f"（メモ：{note}）" if note else ""
+        return f"{name}……{base}{thought}{note_hint} {random.choice(FOLLOWUPS)}"
+
+    # 4) 感情っぽい文（疲れた/眠い/しんどい等）には寄り添い＋一手
+    if any(x in t for x in ["眠い", "つらい", "しんどい", "無理", "きつい", "不安", "こわい", "寂しい", "イライラ"]):
+        plan = random.choice([
+            "水を一口→深呼吸→30秒だけ目を閉じる……",
+            "5分だけ休んで、次は『一個だけ終わらせる』……",
+            "いまは『回復優先』でいい……",
+        ])
+        return f"{name}……それ、ちゃんと重い……😳 まずは……{plan} どう……？"
+
+    # 5) 普通の雑談は“短い感想＋問い返し”
+    return f"{name}……{random.choice(['なるほど……', 'ふむ……', 'それ、いい……', 'わかる……'])}{random.choice(EMOJI)} {random.choice(FOLLOWUPS)}"
+
+# --- DMコマンド ---
 async def handle_command(message: discord.Message, name: str) -> bool:
-    content = (message.content or "").strip()
-    if not content.startswith("!"):
+    t = norm(message.content)
+    if not t.startswith("!"):
         return False
 
-    parts = content.split(maxsplit=1)
+    parts = t.split(maxsplit=1)
     cmd = parts[0].lower()
 
     if cmd in ("!help", "!h"):
         await message.channel.send(
-            "るびコマンド✨\n"
-            "・!name <呼び名>  → るびがあなたをそう呼ぶ\n"
-            "・!ping            → 生存確認\n"
-            "・!mode            → 反応ルール説明\n"
+            "るび（無料・Bタイプ）コマンド✨\n"
+            "・!name <呼び名>\n"
+            "・!note <メモ>  (るびがあなたの特徴を覚える)\n"
+            "・!ping\n"
         )
         return True
 
     if cmd == "!ping":
-        await message.channel.send(f"{name}……いる……✨")
-        return True
-
-    if cmd == "!mode":
-        await message.channel.send(
-            "るびは基本『DM / メンション / るびって呼ばれた時』に返事するよ😊\n"
-            "おはよう・おやすみ・おつかれ にも反応する✨"
-        )
+        await message.channel.send(f"{name}……いるよ……✨")
         return True
 
     if cmd == "!name":
         if len(parts) < 2 or not parts[1].strip():
-            await message.channel.send("呼び名を教えて……例： `!name ちち` 😳")
+            await message.channel.send("呼び名……教えて……例： `!name ちち` 😳")
             return True
         nickname = parts[1].strip()[:20]
         memory_store.set_nickname(str(message.author.id), nickname)
         await message.channel.send(f"了解……✨ これから {nickname} って呼ぶ……")
         return True
 
-    await message.channel.send("それ……わからない……！ `!help` みて……😳")
+    if cmd == "!note":
+        if len(parts) < 2 or not parts[1].strip():
+            await message.channel.send("メモ内容……教えて……例： `!note 夜型。スタレ好き。` 😳")
+            return True
+        memory_store.set_note(str(message.author.id), parts[1].strip())
+        await message.channel.send("メモ……覚えた……✨（会話に少しだけ混ぜる……）")
+        return True
+
+    await message.channel.send("そのコマンド……わからない…… `!help` ……😳")
     return True
 
+# --- Discord events ---
 @client.event
 async def on_ready():
     memory_store.init_db()
@@ -123,80 +172,42 @@ async def on_message(message: discord.Message):
     if message.author.bot:
         return
 
-    content = (message.content or "").strip()
-    if not content:
+    # DM専用（公開チャンネル荒らさない）
+    if not isinstance(message.channel, discord.DMChannel):
+        return
+
+    text = norm(message.content)
+    if not text:
         return
 
     memory_store.init_db()
 
-    ch_id = str(message.channel.id)
-    memory_store.add_channel_message(ch_id, str(message.author.id), content)
+    user_id = str(message.author.id)
+    nickname = memory_store.get_nickname(user_id) or "ちち"
 
-    nickname = memory_store.get_nickname(str(message.author.id))
-    name = nickname or "ちち"
+    # ログは保存（賢さの“文脈感”に使える）
+    memory_store.add_channel_message(str(message.channel.id), user_id, text)
 
-    # コマンド
-    if await handle_command(message, name):
+    if await handle_command(message, nickname):
         return
 
-    # 反応条件に合わないなら黙る（スパム防止）
-    if not should_reply(message):
-        return
+    note = memory_store.get_note(user_id)
+    recent = memory_store.get_recent_messages(str(message.channel.id), limit=10)
 
-    # あいさつ即反応
-    g = greeting_reply(content, name)
-    if g:
-        await message.channel.send(g)
-        return
+    reply = make_reply(nickname, text, note, recent)
 
-    # ===== 学習：短すぎる発言は食べない（ループ防止の核心） =====
-    if len(content) > 5:
-        ruby.feed(content)
-        ruby.feed(f"{name} の言葉: {content}")
-
-    # 直近ログも「短すぎるものは除外」して入れる
-    recent = memory_store.get_recent_messages(ch_id, limit=8)
-    for _, txt in recent:
-        if txt and len(txt.strip()) > 5:
-            ruby.feed(txt.strip())
-
-    # 質問に答えやすくする誘導
-    if "今何してる" in content or "いまなにしてる" in content or "何してる" in content:
-        ruby.feed("質問には具体的に答える。例：休憩してる、ゲームしてる、仕事してる。")
-
-    # 生成
-    reply = ruby.gen(seed=content, max_len=140).strip()
-
-    # ===== 同じ返事を連発しない =====
-    last_reply = getattr(client, "_last_reply", "")
-    if reply == last_reply or reply.replace(" ", "") == last_reply.replace(" ", ""):
-        ruby.feed("同じ返事はしない。別の言い方にする。")
-        reply = ruby.gen(seed=content + " 別の言い方", max_len=140).strip()
-
-    client._last_reply = reply
-
-    # 名前が入ってなければ先頭につける（呼び名固定）
-    if name not in reply:
-        reply = f"{name}……{reply}"
-
-    # えへへ過剰を防ぐ：たまにだけ付ける（2回に1回くらい）
-    count = getattr(client, "_eh_count", 0)
-    client._eh_count = count + 1
-    if "えへへ" not in reply and (client._eh_count % 2 == 0):
+    # るびらしさ（たまに）
+    if random.random() < 0.33 and "えへへ" not in reply:
         reply += " えへへ😊"
 
-    try:
-        await message.channel.send(reply[:1900])
-    except Exception as e:
-        print("SEND ERROR:", repr(e))
+    await message.channel.send(reply[:1900])
 
 async def main():
-    if not TOKEN:
+    if not DISCORD_TOKEN:
         raise RuntimeError("DISCORD_TOKEN が設定されていません")
-
     memory_store.init_db()
     await start_web_server()
-    await client.start(TOKEN)
+    await client.start(DISCORD_TOKEN)
 
 if __name__ == "__main__":
     asyncio.run(main())
