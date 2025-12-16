@@ -5,9 +5,10 @@ from aiohttp import web
 from openai import OpenAI
 from datetime import date, datetime
 import random
+import re
 
 try:
-    from zoneinfo import ZoneInfo  # Python 3.9+
+    from zoneinfo import ZoneInfo
 except Exception:
     ZoneInfo = None
 
@@ -55,7 +56,6 @@ CHICHI_SYSTEM = """
 ・絵文字は少しだけ増やしてOK。
 """
 
-# ===== 感情タグ説明 =====
 EMOTION_GUIDE = """
 感情タグの意味：
 - affectionate: 甘え/親密
@@ -67,7 +67,6 @@ EMOTION_GUIDE = """
 - neutral: ふつう
 """
 
-# ===== 今日の気分説明 =====
 MOOD_GUIDE = """
 今日の気分タグ：
 - sunny: 明るめ
@@ -79,6 +78,7 @@ MOOD_GUIDE = """
 - shy: てれ
 """
 
+# ===== Discord =====
 intents = discord.Intents.default()
 intents.message_content = True
 intents.dm_messages = True
@@ -129,18 +129,45 @@ def daily_mood_base(uid: str) -> str:
 def mood_with_night_bias(uid: str) -> str:
     base = daily_mood_base(uid)
     hour = jst_now().hour
-
     if not (hour >= 22 or hour <= 5):
         return base
-
     seed = f"{today_str()}:{uid}:night:{hour}"
     rng = random.Random(seed)
-
     if base == "sleepy":
         return "sleepy"
     return "sleepy" if rng.random() < 0.7 else base
 
-def build_messages(display_name, history, user_text, chichi, homecoming, emo_tag, daily_mood):
+# --- Morning greet logic (1 day 1 time) ---
+def user_said_morning_greet(text: str) -> bool:
+    t = (text or "").strip()
+    return ("おはよう" in t) or (re.search(r"(おは(よ|ょ)?|おはー)", t) is not None)
+
+def allow_morning_greet(uid: str, text: str) -> bool:
+    """
+    ユーザーが朝挨拶した & 今日はまだbotが朝挨拶を返していない → True
+    """
+    if not user_said_morning_greet(text):
+        return False
+    today = today_str()
+    last = memory_store.get_last_morning_greet_date(uid)
+    return last != today
+
+def mark_morning_greet_done(uid: str):
+    memory_store.set_last_morning_greet_date(uid, today_str())
+
+def strip_greetings_if_needed(reply: str, allow_greet: bool) -> str:
+    if allow_greet:
+        # 万が一「おは」連打になった時の保険：冒頭を1回にする
+        r = reply
+        r = re.sub(r"^(おは(よう)?[!！。…〜\s]*)(\1)+", r"\1", r)
+        return r
+
+    # 禁止の時は冒頭の挨拶を1回だけ剥がす（壊れにくい）
+    r = reply.lstrip()
+    r = re.sub(r"^(おは(よう)?|こんにちは|こんばんは|やあ|はろー|ハロー)[!！。…〜\s]+", "", r, count=1)
+    return r.strip() if r.strip() else reply.strip()
+
+def build_messages(display_name, history, user_text, chichi, homecoming, emo_tag, daily_mood, allow_greet):
     msgs = [{"role": "system", "content": RUBY_SYSTEM}]
 
     if chichi:
@@ -154,7 +181,7 @@ def build_messages(display_name, history, user_text, chichi, homecoming, emo_tag
     msgs.append({"role": "system", "content": f"現在の感情タグ: {emo_tag}"})
     msgs.append({"role": "system", "content": f"今日の気分タグ: {daily_mood}（少しだけ反映）"})
 
-    # 🌙 深夜ふにゃルール（★ここが追加点）
+    # 🌙 深夜ふにゃルール
     if is_deep_night():
         msgs.append({
             "role": "system",
@@ -168,6 +195,25 @@ def build_messages(display_name, history, user_text, chichi, homecoming, emo_tag
             )
         })
 
+    # ☀️ 朝挨拶ゲート（★1日1回）
+    if allow_greet:
+        msgs.append({
+            "role": "system",
+            "content": (
+                "今回は相手が朝の挨拶をした。あなたも『おはよう』を返してよい。"
+                "ただし挨拶は返信の冒頭に1回だけ。繰り返し禁止。"
+            )
+        })
+    else:
+        msgs.append({
+            "role": "system",
+            "content": (
+                "今回は朝の挨拶のターンではない。"
+                "『おはよう』『こんにちは』『こんばんは』など挨拶は言わない。"
+            )
+        })
+
+    # 帰宅ゲート
     if homecoming:
         msgs.append({"role": "system", "content": "帰宅の挨拶なので「おかえり」は1回だけOK。"})
     else:
@@ -189,7 +235,7 @@ def call_openai(messages, chichi: bool):
     )
     return (resp.output_text or "").strip()
 
-# ---------------- Discord events ----------------
+# ---------------- Discord Events ----------------
 @client.event
 async def on_ready():
     memory_store.init_db()
@@ -209,9 +255,12 @@ async def on_message(message: discord.Message):
     uid = str(message.author.id)
     ch_id = str(message.channel.id)
 
+    memory_store.init_db()
+
     chichi = is_chichi(uid)
     homecoming = is_homecoming(text)
 
+    # ---- コマンド ----
     if text == "!whoami":
         await message.channel.send(f"あなたのIDは `{uid}` だよ✨")
         return
@@ -222,42 +271,45 @@ async def on_message(message: discord.Message):
         await message.channel.send(f"了解……✨ これから {name} って呼ぶね……えへへ😊")
         return
 
+    # ---- 1日回数制限（★ちちは無制限）----
     if not chichi:
         today = today_str()
-        if memory_store.get_daily_count(uid, today) >= DAILY_LIMIT:
-            await message.channel.send("今日はここまで……また明日ね……🌙")
+        count = memory_store.get_daily_count(uid, today)
+        if count >= DAILY_LIMIT:
+            await message.channel.send("今日はたくさんお話ししたね……😊 また明日ね……🌙")
             return
         memory_store.increment_daily_count(uid, today)
 
-    # 感情更新
+    # ---- 朝挨拶：今日は返していい？ ----
+    allow_greet = allow_morning_greet(uid, text)
+
+    # ---- 感情更新 ----
     v, a, t, emo_tag = memory_store.update_emotion_by_text(uid, text, chichi)
 
-    # 今日の気分（夜補正込み）
+    # ---- 今日の気分（夜補正込み）----
     daily_mood = mood_with_night_bias(uid)
 
+    # ---- 表示名 ----
     display_name = memory_store.get_nickname(uid) or "あなた"
 
+    # ---- 履歴保存（ユーザー発言）----
     memory_store.add_channel_message(ch_id, uid, text)
-    recent = memory_store.get_recent_messages(ch_id, limit=12)
+    recent = memory_store.get_recent_messages(ch_id, limit=20)
 
-    if recent and recent[-1][0] == uid and recent[-1][1] == text:
+    # ★重複防止：直近が今の発言なら履歴から外す
+    if recent and str(recent[-1][0]) == str(uid) and recent[-1][1] == text:
         recent = recent[:-1]
 
     history = []
     for aid, content in recent:
-        role = "user" if aid == uid else "assistant"
+        role = "user" if str(aid) == str(uid) else "assistant"
         history.append((role, content))
 
+    # ★帰宅じゃない時は、帰宅挨拶の履歴を会話コンテキストから排除
     if not homecoming:
-        history = [
-            (r, c) for r, c in history
-            if ("ただいま" not in c and "おかえり" not in c)
-        ]
+        history = [(r, c) for r, c in history if ("ただいま" not in c and "おかえり" not in c)]
 
-    messages = build_messages(
-        display_name, history, text,
-        chichi, homecoming, emo_tag, daily_mood
-    )
+    messages = build_messages(display_name, history, text, chichi, homecoming, emo_tag, daily_mood, allow_greet)
 
     try:
         reply = await asyncio.to_thread(call_openai, messages, chichi)
@@ -266,10 +318,33 @@ async def on_message(message: discord.Message):
         await message.channel.send("……ごめん……今ちょっとつまずいた……💦")
         return
 
-    await message.channel.send((reply or "……もう一回、聞いてもいい……？")[:1900])
+    if not reply:
+        reply = "……もう一回、聞いてもいい……？"
+
+    # 送信前に挨拶を整える（暴走保険）
+    reply = strip_greetings_if_needed(reply, allow_greet)
+
+    await message.channel.send(reply[:1900])
+
+    # ★朝挨拶したなら「今日は返した」記録（重要：翌日はまた返せる）
+    if allow_greet:
+        mark_morning_greet_done(uid)
+
+    # bot返信も履歴に保存（会話が安定する）
+    try:
+        memory_store.add_channel_message(ch_id, "BOT", reply[:1900])
+    except Exception as e:
+        print("Memory save bot ERROR:", e)
 
 # ---------------- main ----------------
 async def main():
+    if not DISCORD_TOKEN:
+        raise RuntimeError("DISCORD_TOKEN が未設定")
+    if not OPENAI_API_KEY:
+        raise RuntimeError("OPENAI_API_KEY が未設定")
+    if not OWNER_ID:
+        raise RuntimeError("OWNER_ID が未設定（ちちのDiscordユーザーID）")
+
     await start_web_server()
     await client.start(DISCORD_TOKEN)
 
