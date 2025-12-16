@@ -40,10 +40,17 @@ async def on_ready():
 
 @client.event
 async def on_message(msg):
+    print("MESSAGE EVENT:", msg.content)  # ★追加
+    print("AUTHOR:", msg.author, "BOT?", msg.author.bot)  # ★追加
+
     if msg.author.bot:
         return
     if not msg.content.strip():
         return
+
+    ruby.feed(msg.content)
+    reply = ruby.gen(seed=msg.content, max_len=120)
+    await msg.channel.send(reply)
 
     # 学習（ちちの発言を食べる）
     ruby.feed(msg.content)
