@@ -165,7 +165,6 @@ def build_messages(display_name, history, user_text, chichi, homecoming, emo_tag
     msgs.append({"role": "system", "content": f"現在の感情タグ: {emo_tag}"})
     msgs.append({"role": "system", "content": f"今日の気分タグ: {daily_mood}（少しだけ反映）"})
 
-    # 深夜ふにゃ
     if is_deep_night():
         msgs.append({
             "role": "system",
@@ -176,13 +175,11 @@ def build_messages(display_name, history, user_text, chichi, homecoming, emo_tag
             )
         })
 
-    # 朝挨拶ゲート（1日1回）
     if allow_greet:
         msgs.append({"role": "system", "content": "相手が朝の挨拶をした。『おはよう』は冒頭に1回だけ返してよい。繰り返し禁止。"})
     else:
         msgs.append({"role": "system", "content": "朝の挨拶のターンではない。『おはよう/こんにちは/こんばんは』など挨拶は言わない。"})
 
-    # 帰宅ゲート
     if homecoming:
         msgs.append({"role": "system", "content": "帰宅の挨拶なので「おかえり」は1回だけOK。"})
     else:
@@ -205,7 +202,6 @@ def call_openai(messages, chichi: bool):
 
 @client.event
 async def on_ready():
-    # ★GitHubから復元（ネットワークなのでスレッドへ）
     await asyncio.to_thread(memory_store.init_db)
     print(f"Ruby ready! Logged in as {client.user}")
 
@@ -237,7 +233,6 @@ async def on_message(message: discord.Message):
         await asyncio.to_thread(memory_store.maybe_flush)
         return
 
-    # 回数制限（ちちは無制限）
     if not chichi:
         today = today_str()
         if memory_store.get_daily_count(uid, today) >= DAILY_LIMIT:
@@ -247,26 +242,19 @@ async def on_message(message: discord.Message):
 
     allow_greet = allow_morning_greet(uid, text)
 
-    # 感情更新
     v, a, t, emo_tag = memory_store.update_emotion_by_text(uid, text, chichi)
-
-    # 気分（夜補正）
     daily_mood = mood_with_night_bias(uid)
 
-    # 表示名
     display_name = memory_store.get_nickname(uid) or "あなた"
 
-    # 履歴保存（ユーザー）
     memory_store.add_channel_message(ch_id, uid, text)
     recent = memory_store.get_recent_messages(ch_id, limit=20)
 
-    # 履歴整形
     history = []
     for aid, content in recent:
         role = "user" if str(aid) == str(uid) else "assistant"
         history.append((role, content))
 
-    # 帰宅じゃない時は帰宅系を除外
     if not homecoming:
         history = [(r, c) for r, c in history if ("ただいま" not in c and "おかえり" not in c)]
 
@@ -285,14 +273,11 @@ async def on_message(message: discord.Message):
     reply = strip_greetings_if_needed(reply, allow_greet)
     await message.channel.send(reply[:1900])
 
-    # 朝挨拶を返した日を記録（翌日はまた返せる）
     if allow_greet:
         mark_morning_greet_done(uid)
 
-    # bot返信も保存（会話の安定用）
     memory_store.add_channel_message(ch_id, "BOT", reply[:1900])
 
-    # ★GitHubへ自動保存（間引きあり）
     await asyncio.to_thread(memory_store.maybe_flush)
 
 async def main():
