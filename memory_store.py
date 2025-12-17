@@ -6,40 +6,41 @@ import urllib.request
 import urllib.error
 from datetime import date
 
-# ===== GitHub settings (env) =====
+# ===== GitHub env =====
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
-GITHUB_REPO = os.getenv("GITHUB_REPO")          # "owner/repo"
+GITHUB_REPO = os.getenv("GITHUB_REPO")                 # "owner/repo"
 GITHUB_BRANCH = os.getenv("GITHUB_BRANCH", "main")
-GITHUB_PATH = os.getenv("GITHUB_PATH", "ruby_memory.json")
+GITHUB_PATH_BASE = os.getenv("GITHUB_PATH_BASE", "ruby_mem")  # ★ベースフォルダ
 
 GITHUB_API = "https://api.github.com"
 
-# ===== Flush policy =====
-MIN_FLUSH_INTERVAL_SEC = 60          # 最短1分おき
-FORCE_FLUSH_AFTER_DIRTY_SEC = 180    # 汚れたまま3分経ったら強制
-MAX_MSG_PER_CHANNEL = 80             # 履歴肥大化防止
+# ===== flush policy =====
+MIN_FLUSH_INTERVAL_SEC = 60
+FORCE_FLUSH_AFTER_DIRTY_SEC = 180
+MAX_MSG_PER_CHANNEL = 80
 
-_state = None
-_sha = None
-_dirty = False
-_last_flush_ts = 0.0
-_dirty_since_ts = 0.0
+# caches
+_user_cache = {}          # uid -> dict
+_channel_cache = {}       # chid -> dict
+_sha_cache = {}           # path -> sha
+
+_dirty_paths = set()      # set of github paths
+_dirty_since = {}         # path -> ts
+_last_flush = {}          # path -> ts
 
 
-# ---------------- internal helpers ----------------
-def _today_str():
-    return date.today().isoformat()
-
-def _now():
-    return time.time()
-
+# ---------------- GitHub helpers ----------------
 def _ensure_env():
     missing = []
     if not GITHUB_TOKEN: missing.append("GITHUB_TOKEN")
     if not GITHUB_REPO: missing.append("GITHUB_REPO")
-    if not GITHUB_PATH: missing.append("GITHUB_PATH")
+    if not GITHUB_BRANCH: missing.append("GITHUB_BRANCH")
+    if not GITHUB_PATH_BASE: missing.append("GITHUB_PATH_BASE")
     if missing:
-        raise RuntimeError(f"GitHub永続化に必要な環境変数が未設定: {', '.join(missing)}")
+        raise RuntimeError("GitHub永続化に必要な環境変数が未設定: " + ", ".join(missing))
+
+def _now():
+    return time.time()
 
 def _gh_request(method: str, url: str, body: dict | None = None):
     headers = {
@@ -65,29 +66,220 @@ def _gh_request(method: str, url: str, body: dict | None = None):
             payload = {"raw": raw}
         return e.code, payload
 
-def _gh_contents_url():
-    # /repos/{owner}/{repo}/contents/{path}?ref={branch}
-    return f"{GITHUB_API}/repos/{GITHUB_REPO}/contents/{GITHUB_PATH}?ref={GITHUB_BRANCH}"
+def _contents_url(path: str):
+    return f"{GITHUB_API}/repos/{GITHUB_REPO}/contents/{path}?ref={GITHUB_BRANCH}"
 
-def _gh_put_url():
-    return f"{GITHUB_API}/repos/{GITHUB_REPO}/contents/{GITHUB_PATH}"
+def _put_url(path: str):
+    return f"{GITHUB_API}/repos/{GITHUB_REPO}/contents/{path}"
 
-def _default_state():
+def _b64_encode(s: str) -> str:
+    return base64.b64encode(s.encode("utf-8")).decode("utf-8")
+
+def _b64_decode(b64: str) -> str:
+    return base64.b64decode(b64).decode("utf-8")
+
+def _mark_dirty(path: str):
+    _dirty_paths.add(path)
+    if path not in _dirty_since:
+        _dirty_since[path] = _now()
+
+def _default_user_state(uid: str):
     return {
-        "nicknames": {},          # user_id -> nickname
-        "daily_counts": {},       # "user_id|ymd" -> count
-        "channel_messages": {},   # channel_id -> [{"a":author_id,"c":content,"t":unix}, ...]
-        "user_emotion": {},       # user_id -> {"v":float,"a":float,"t":float,"tag":str}
-        "user_kv": {},            # "user_id|key" -> value(str)
+        "uid": uid,
+        "nick": None,
+        "daily_counts": {},            # ymd -> count
+        "kv": {},                      # key -> value(str)
+        "emotion": {"v": 0.0, "a": 0.0, "t": 0.0, "tag": "neutral"},
         "meta": {"version": 1, "last_saved": None},
     }
 
-def _mark_dirty():
-    global _dirty, _dirty_since_ts
-    _dirty = True
-    if _dirty_since_ts == 0.0:
-        _dirty_since_ts = _now()
+def _default_channel_state(chid: str):
+    return {
+        "chid": chid,
+        "messages": [],                # [{a, c, t}, ...]
+        "meta": {"version": 1, "last_saved": None},
+    }
 
+def _user_path(uid: str) -> str:
+    return f"{GITHUB_PATH_BASE}/users/{uid}.json"
+
+def _channel_path(chid: str) -> str:
+    return f"{GITHUB_PATH_BASE}/channels/{chid}.json"
+
+def _load_json_from_github(path: str, default_obj: dict):
+    _ensure_env()
+    status, payload = _gh_request("GET", _contents_url(path), None)
+    if status == 200 and "content" in payload:
+        _sha_cache[path] = payload.get("sha")
+        decoded = _b64_decode(payload["content"])
+        try:
+            return json.loads(decoded)
+        except Exception:
+            return default_obj
+    if status == 404:
+        _sha_cache[path] = None
+        return default_obj
+    raise RuntimeError(f"GitHub読み込み失敗: {path} HTTP {status} {payload}")
+
+def _save_json_to_github(path: str, obj: dict, force: bool = False):
+    _ensure_env()
+
+    # flush throttling
+    now = _now()
+    last = _last_flush.get(path, 0.0)
+    if (not force) and (now - last < MIN_FLUSH_INTERVAL_SEC):
+        return
+
+    obj.setdefault("meta", {})
+    obj["meta"]["last_saved"] = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
+
+    raw = json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
+    body = {
+        "message": f"Update ruby memory: {path}",
+        "content": _b64_encode(raw),
+        "branch": GITHUB_BRANCH,
+    }
+    sha = _sha_cache.get(path)
+    if sha:
+        body["sha"] = sha
+
+    # retry on 409 a few times
+    for _ in range(5):
+        status, payload = _gh_request("PUT", _put_url(path), body)
+        if status in (200, 201):
+            new_sha = payload.get("content", {}).get("sha")
+            if new_sha:
+                _sha_cache[path] = new_sha
+            _last_flush[path] = now
+            _dirty_paths.discard(path)
+            _dirty_since.pop(path, None)
+            return
+
+        if status == 409:
+            # refetch sha then retry
+            st2, p2 = _gh_request("GET", _contents_url(path), None)
+            if st2 == 200 and "sha" in p2:
+                _sha_cache[path] = p2["sha"]
+                body["sha"] = _sha_cache[path]
+                time.sleep(0.4)
+                continue
+            if st2 == 404:
+                _sha_cache[path] = None
+                body.pop("sha", None)
+                time.sleep(0.4)
+                continue
+
+        # other error
+        raise RuntimeError(f"GitHub保存失敗: {path} HTTP {status} {payload}")
+
+    raise RuntimeError(f"GitHub保存が競合で失敗しました: {path}")
+
+# ---------------- public API ----------------
+def init_db():
+    # 遅延ロード方式なので、環境変数チェックだけしておく
+    _ensure_env()
+
+def flush(force: bool = False):
+    init_db()
+    # dirty全部を順に保存
+    for path in list(_dirty_paths):
+        # 強制 or 汚れっぱなしが長いなら保存
+        if force:
+            _save_json_to_github(path, _obj_for_path(path), force=True)
+        else:
+            since = _dirty_since.get(path, 0.0)
+            if (_now() - since) >= FORCE_FLUSH_AFTER_DIRTY_SEC:
+                _save_json_to_github(path, _obj_for_path(path), force=True)
+            else:
+                _save_json_to_github(path, _obj_for_path(path), force=False)
+
+def maybe_flush():
+    init_db()
+    for path in list(_dirty_paths):
+        since = _dirty_since.get(path, 0.0)
+        last = _last_flush.get(path, 0.0)
+        now = _now()
+        if now - last >= MIN_FLUSH_INTERVAL_SEC:
+            _save_json_to_github(path, _obj_for_path(path), force=False)
+        elif since and (now - since >= FORCE_FLUSH_AFTER_DIRTY_SEC):
+            _save_json_to_github(path, _obj_for_path(path), force=True)
+
+def _obj_for_path(path: str) -> dict:
+    # pathからどのキャッシュか判定
+    if "/users/" in path:
+        uid = os.path.splitext(os.path.basename(path))[0]
+        return _user_cache.get(uid) or _default_user_state(uid)
+    if "/channels/" in path:
+        chid = os.path.splitext(os.path.basename(path))[0]
+        return _channel_cache.get(chid) or _default_channel_state(chid)
+    return {}
+
+def _get_user(uid: str) -> dict:
+    uid = str(uid)
+    if uid not in _user_cache:
+        _user_cache[uid] = _load_json_from_github(_user_path(uid), _default_user_state(uid))
+    return _user_cache[uid]
+
+def _get_channel(chid: str) -> dict:
+    chid = str(chid)
+    if chid not in _channel_cache:
+        _channel_cache[chid] = _load_json_from_github(_channel_path(chid), _default_channel_state(chid))
+    return _channel_cache[chid]
+
+# ---------- Nickname ----------
+def set_nickname(user_id: str, nickname: str):
+    u = _get_user(user_id)
+    u["nick"] = nickname
+    _mark_dirty(_user_path(str(user_id)))
+
+def get_nickname(user_id: str):
+    u = _get_user(user_id)
+    return u.get("nick")
+
+# ---------- Daily counts ----------
+def get_daily_count(user_id: str, ymd: str):
+    u = _get_user(user_id)
+    return int(u.get("daily_counts", {}).get(str(ymd), 0))
+
+def increment_daily_count(user_id: str, ymd: str):
+    u = _get_user(user_id)
+    dc = u.setdefault("daily_counts", {})
+    key = str(ymd)
+    dc[key] = int(dc.get(key, 0)) + 1
+    _mark_dirty(_user_path(str(user_id)))
+
+# ---------- Channel messages ----------
+def add_channel_message(channel_id: str, author_id: str, content: str):
+    ch = _get_channel(channel_id)
+    arr = ch.setdefault("messages", [])
+    arr.append({"a": str(author_id), "c": str(content), "t": int(_now())})
+    if len(arr) > MAX_MSG_PER_CHANNEL:
+        ch["messages"] = arr[-MAX_MSG_PER_CHANNEL:]
+    _mark_dirty(_channel_path(str(channel_id)))
+
+def get_recent_messages(channel_id: str, limit: int = 12):
+    ch = _get_channel(channel_id)
+    arr = ch.get("messages", [])
+    sliced = arr[-int(limit):]
+    return [(m["a"], m["c"]) for m in sliced]
+
+# ---------- KV ----------
+def _kv_get(user_id: str, key: str):
+    u = _get_user(user_id)
+    return u.setdefault("kv", {}).get(str(key))
+
+def _kv_set(user_id: str, key: str, value: str):
+    u = _get_user(user_id)
+    u.setdefault("kv", {})[str(key)] = str(value)
+    _mark_dirty(_user_path(str(user_id)))
+
+def get_last_morning_greet_date(user_id: str):
+    return _kv_get(user_id, "last_morning_greet_date")
+
+def set_last_morning_greet_date(user_id: str, ymd: str):
+    _kv_set(user_id, "last_morning_greet_date", ymd)
+
+# ---------- Emotion ----------
 def _clamp(x, lo=-1.0, hi=1.0):
     return max(lo, min(hi, x))
 
@@ -106,182 +298,13 @@ def _tag_from_state(v, a, t):
         return "calm"
     return "neutral"
 
-
-# ---------------- public API ----------------
-def init_db():
-    """
-    GitHub上のJSONを読み込み、メモリに復元する。
-    ファイルが無ければ新規作成状態で開始。
-    """
-    global _state, _sha, _dirty, _last_flush_ts, _dirty_since_ts
-
-    _ensure_env()
-
-    if _state is not None:
-        return
-
-    status, payload = _gh_request("GET", _gh_contents_url(), None)
-
-    if status == 200 and "content" in payload:
-        content_b64 = payload["content"]
-        _sha = payload.get("sha")
-        decoded = base64.b64decode(content_b64).decode("utf-8")
-        try:
-            _state = json.loads(decoded)
-        except Exception:
-            _state = _default_state()
-    elif status == 404:
-        _state = _default_state()
-        _sha = None
-        _mark_dirty()  # 初回は作りたい
-    else:
-        raise RuntimeError(f"GitHub読み込み失敗: HTTP {status} {payload}")
-
-    _dirty = False
-    _dirty_since_ts = 0.0
-    _last_flush_ts = _now()
-
-def flush(force: bool = False):
-    """
-    GitHubに保存。force=True で即保存。
-    """
-    global _sha, _dirty, _last_flush_ts, _dirty_since_ts
-
-    init_db()
-
-    if not _dirty and not force:
-        return
-
-    # 連投抑制
-    now = _now()
-    if (not force) and (now - _last_flush_ts < MIN_FLUSH_INTERVAL_SEC):
-        return
-
-    _state["meta"]["last_saved"] = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
-
-    raw = json.dumps(_state, ensure_ascii=False, separators=(",", ":"))
-    content_b64 = base64.b64encode(raw.encode("utf-8")).decode("utf-8")
-
-    body = {
-        "message": "Update ruby memory",
-        "content": content_b64,
-        "branch": GITHUB_BRANCH,
-    }
-    if _sha:
-        body["sha"] = _sha
-
-    status, payload = _gh_request("PUT", _gh_put_url(), body)
-
-    if status in (200, 201):
-        _sha = payload.get("content", {}).get("sha", _sha)
-        _dirty = False
-        _dirty_since_ts = 0.0
-        _last_flush_ts = now
-        return
-
-    # sha競合など：一回だけ取り直して再実行
-    if status == 409:
-        st2, p2 = _gh_request("GET", _gh_contents_url(), None)
-        if st2 == 200 and "sha" in p2:
-            _sha = p2["sha"]
-            body["sha"] = _sha
-            st3, p3 = _gh_request("PUT", _gh_put_url(), body)
-            if st3 in (200, 201):
-                _sha = p3.get("content", {}).get("sha", _sha)
-                _dirty = False
-                _dirty_since_ts = 0.0
-                _last_flush_ts = now
-                return
-
-    raise RuntimeError(f"GitHub保存失敗: HTTP {status} {payload}")
-
-def maybe_flush():
-    """
-    bot側でちょこちょこ呼んでOK。
-    汚れが溜まったら勝手に保存する。
-    """
-    init_db()
-
-    if not _dirty:
-        return
-
-    now = _now()
-    # 最短間隔を過ぎてたら保存
-    if now - _last_flush_ts >= MIN_FLUSH_INTERVAL_SEC:
-        flush(force=False)
-        return
-
-    # 汚れてから一定時間経ってたら強制
-    if _dirty_since_ts and (now - _dirty_since_ts >= FORCE_FLUSH_AFTER_DIRTY_SEC):
-        flush(force=True)
-
-# ---------- Nickname ----------
-def set_nickname(user_id: str, nickname: str):
-    init_db()
-    _state["nicknames"][str(user_id)] = nickname
-    _mark_dirty()
-
-def get_nickname(user_id: str):
-    init_db()
-    return _state["nicknames"].get(str(user_id))
-
-# ---------- Daily counts ----------
-def get_daily_count(user_id: str, ymd: str):
-    init_db()
-    key = f"{user_id}|{ymd}"
-    return int(_state["daily_counts"].get(key, 0))
-
-def increment_daily_count(user_id: str, ymd: str):
-    init_db()
-    key = f"{user_id}|{ymd}"
-    _state["daily_counts"][key] = int(_state["daily_counts"].get(key, 0)) + 1
-    _mark_dirty()
-
-# ---------- Channel messages ----------
-def add_channel_message(channel_id: str, author_id: str, content: str):
-    init_db()
-    cid = str(channel_id)
-    arr = _state["channel_messages"].get(cid, [])
-    arr.append({"a": str(author_id), "c": str(content), "t": int(_now())})
-    # cap
-    if len(arr) > MAX_MSG_PER_CHANNEL:
-        arr = arr[-MAX_MSG_PER_CHANNEL:]
-    _state["channel_messages"][cid] = arr
-    _mark_dirty()
-
-def get_recent_messages(channel_id: str, limit: int = 12):
-    init_db()
-    cid = str(channel_id)
-    arr = _state["channel_messages"].get(cid, [])
-    sliced = arr[-int(limit):]
-    return [(m["a"], m["c"]) for m in sliced]
-
-# ---------- KV ----------
-def _kv_get(user_id: str, key: str):
-    init_db()
-    return _state["user_kv"].get(f"{user_id}|{key}")
-
-def _kv_set(user_id: str, key: str, value: str):
-    init_db()
-    _state["user_kv"][f"{user_id}|{key}"] = str(value)
-    _mark_dirty()
-
-def get_last_morning_greet_date(user_id: str):
-    return _kv_get(user_id, "last_morning_greet_date")
-
-def set_last_morning_greet_date(user_id: str, ymd: str):
-    _kv_set(user_id, "last_morning_greet_date", ymd)
-
-# ---------- Emotion ----------
 def update_emotion_by_text(user_id: str, text: str, chichi: bool):
-    init_db()
-    uid = str(user_id)
-    emo = _state["user_emotion"].get(uid, {"v": 0.0, "a": 0.0, "t": 0.0, "tag": "neutral"})
+    u = _get_user(user_id)
+    emo = u.get("emotion", {"v": 0.0, "a": 0.0, "t": 0.0, "tag": "neutral"})
     v, a, t = float(emo["v"]), float(emo["a"]), float(emo["t"])
 
     s = (text or "")
 
-    # 減衰（落ち着く）
     v *= 0.92
     a *= 0.90
     t *= 0.94
@@ -313,6 +336,6 @@ def update_emotion_by_text(user_id: str, text: str, chichi: bool):
     v = _clamp(v); a = _clamp(a); t = _clamp(t)
     tag = _tag_from_state(v, a, t)
 
-    _state["user_emotion"][uid] = {"v": v, "a": a, "t": t, "tag": tag}
-    _mark_dirty()
+    u["emotion"] = {"v": v, "a": a, "t": t, "tag": tag}
+    _mark_dirty(_user_path(str(user_id)))
     return v, a, t, tag
