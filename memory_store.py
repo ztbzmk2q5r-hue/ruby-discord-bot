@@ -1,171 +1,97 @@
-import sqlite3
+import os
+import json
+import time
+import base64
+import urllib.request
+import urllib.error
 from datetime import date
 
-DB_PATH = "ruby_memory.db"
+# ===== GitHub settings (env) =====
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
+GITHUB_REPO = os.getenv("GITHUB_REPO")          # "owner/repo"
+GITHUB_BRANCH = os.getenv("GITHUB_BRANCH", "main")
+GITHUB_PATH = os.getenv("GITHUB_PATH", "ruby_memory.json")
 
-def _conn():
-    # Renderでも雑に安定するようにタイムアウト長め
-    return sqlite3.connect(DB_PATH, timeout=30)
+GITHUB_API = "https://api.github.com"
 
-def init_db():
-    conn = _conn()
-    cur = conn.cursor()
+# ===== Flush policy =====
+MIN_FLUSH_INTERVAL_SEC = 60          # 最短1分おき
+FORCE_FLUSH_AFTER_DIRTY_SEC = 180    # 汚れたまま3分経ったら強制
+MAX_MSG_PER_CHANNEL = 80             # 履歴肥大化防止
 
-    # 呼び名
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS nicknames (
-        user_id TEXT PRIMARY KEY,
-        nickname TEXT
-    )
-    """)
+_state = None
+_sha = None
+_dirty = False
+_last_flush_ts = 0.0
+_dirty_since_ts = 0.0
 
-    # 1日カウント
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS daily_counts (
-        user_id TEXT NOT NULL,
-        ymd TEXT NOT NULL,
-        count INTEGER NOT NULL DEFAULT 0,
-        PRIMARY KEY (user_id, ymd)
-    )
-    """)
 
-    # DMチャンネル内の履歴
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS channel_messages (
-        channel_id TEXT NOT NULL,
-        author_id TEXT NOT NULL,
-        content TEXT NOT NULL,
-        ts INTEGER NOT NULL DEFAULT (strftime('%s','now'))
-    )
-    """)
+# ---------------- internal helpers ----------------
+def _today_str():
+    return date.today().isoformat()
 
-    # 感情ステート（ユーザー単位）
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS user_emotion (
-        user_id TEXT PRIMARY KEY,
-        valence REAL NOT NULL DEFAULT 0.0,
-        arousal REAL NOT NULL DEFAULT 0.0,
-        tone REAL NOT NULL DEFAULT 0.0,
-        tag TEXT NOT NULL DEFAULT 'neutral'
-    )
-    """)
+def _now():
+    return time.time()
 
-    # ユーザー設定（汎用KV）
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS user_kv (
-        user_id TEXT NOT NULL,
-        key TEXT NOT NULL,
-        value TEXT,
-        PRIMARY KEY (user_id, key)
-    )
-    """)
+def _ensure_env():
+    missing = []
+    if not GITHUB_TOKEN: missing.append("GITHUB_TOKEN")
+    if not GITHUB_REPO: missing.append("GITHUB_REPO")
+    if not GITHUB_PATH: missing.append("GITHUB_PATH")
+    if missing:
+        raise RuntimeError(f"GitHub永続化に必要な環境変数が未設定: {', '.join(missing)}")
 
-    conn.commit()
-    conn.close()
+def _gh_request(method: str, url: str, body: dict | None = None):
+    headers = {
+        "Authorization": f"Bearer {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "ruby-bot",
+    }
+    data = None
+    if body is not None:
+        data = json.dumps(body).encode("utf-8")
+        headers["Content-Type"] = "application/json"
 
-# ---------- Nickname ----------
-def set_nickname(user_id: str, nickname: str):
-    init_db()
-    conn = _conn()
-    cur = conn.cursor()
-    cur.execute("""
-    INSERT INTO nicknames(user_id, nickname) VALUES(?, ?)
-    ON CONFLICT(user_id) DO UPDATE SET nickname=excluded.nickname
-    """, (str(user_id), nickname))
-    conn.commit()
-    conn.close()
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            raw = resp.read().decode("utf-8")
+            return resp.status, json.loads(raw) if raw else {}
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode("utf-8") if e.fp else ""
+        try:
+            payload = json.loads(raw) if raw else {}
+        except Exception:
+            payload = {"raw": raw}
+        return e.code, payload
 
-def get_nickname(user_id: str):
-    init_db()
-    conn = _conn()
-    cur = conn.cursor()
-    cur.execute("SELECT nickname FROM nicknames WHERE user_id=?", (str(user_id),))
-    row = cur.fetchone()
-    conn.close()
-    return row[0] if row else None
+def _gh_contents_url():
+    # /repos/{owner}/{repo}/contents/{path}?ref={branch}
+    return f"{GITHUB_API}/repos/{GITHUB_REPO}/contents/{GITHUB_PATH}?ref={GITHUB_BRANCH}"
 
-# ---------- Daily counts ----------
-def get_daily_count(user_id: str, ymd: str):
-    init_db()
-    conn = _conn()
-    cur = conn.cursor()
-    cur.execute("SELECT count FROM daily_counts WHERE user_id=? AND ymd=?", (str(user_id), ymd))
-    row = cur.fetchone()
-    conn.close()
-    return int(row[0]) if row else 0
+def _gh_put_url():
+    return f"{GITHUB_API}/repos/{GITHUB_REPO}/contents/{GITHUB_PATH}"
 
-def increment_daily_count(user_id: str, ymd: str):
-    init_db()
-    conn = _conn()
-    cur = conn.cursor()
-    cur.execute("""
-    INSERT INTO daily_counts(user_id, ymd, count) VALUES(?, ?, 1)
-    ON CONFLICT(user_id, ymd) DO UPDATE SET count = count + 1
-    """, (str(user_id), ymd))
-    conn.commit()
-    conn.close()
+def _default_state():
+    return {
+        "nicknames": {},          # user_id -> nickname
+        "daily_counts": {},       # "user_id|ymd" -> count
+        "channel_messages": {},   # channel_id -> [{"a":author_id,"c":content,"t":unix}, ...]
+        "user_emotion": {},       # user_id -> {"v":float,"a":float,"t":float,"tag":str}
+        "user_kv": {},            # "user_id|key" -> value(str)
+        "meta": {"version": 1, "last_saved": None},
+    }
 
-# ---------- Channel messages ----------
-def add_channel_message(channel_id: str, author_id: str, content: str):
-    init_db()
-    conn = _conn()
-    cur = conn.cursor()
-    cur.execute(
-        "INSERT INTO channel_messages(channel_id, author_id, content) VALUES(?, ?, ?)",
-        (str(channel_id), str(author_id), str(content))
-    )
-    conn.commit()
-    conn.close()
+def _mark_dirty():
+    global _dirty, _dirty_since_ts
+    _dirty = True
+    if _dirty_since_ts == 0.0:
+        _dirty_since_ts = _now()
 
-def get_recent_messages(channel_id: str, limit: int = 12):
-    init_db()
-    conn = _conn()
-    cur = conn.cursor()
-    cur.execute("""
-    SELECT author_id, content
-    FROM channel_messages
-    WHERE channel_id=?
-    ORDER BY ts DESC
-    LIMIT ?
-    """, (str(channel_id), int(limit)))
-    rows = cur.fetchall()
-    conn.close()
-    rows.reverse()
-    return [(r[0], r[1]) for r in rows]
-
-# ---------- KV ----------
-def _kv_get(user_id: str, key: str):
-    init_db()
-    conn = _conn()
-    cur = conn.cursor()
-    cur.execute("SELECT value FROM user_kv WHERE user_id=? AND key=?", (str(user_id), str(key)))
-    row = cur.fetchone()
-    conn.close()
-    return row[0] if row else None
-
-def _kv_set(user_id: str, key: str, value: str):
-    init_db()
-    conn = _conn()
-    cur = conn.cursor()
-    cur.execute("""
-    INSERT INTO user_kv(user_id, key, value) VALUES(?, ?, ?)
-    ON CONFLICT(user_id, key) DO UPDATE SET value=excluded.value
-    """, (str(user_id), str(key), str(value)))
-    conn.commit()
-    conn.close()
-
-def get_last_morning_greet_date(user_id: str):
-    return _kv_get(user_id, "last_morning_greet_date")
-
-def set_last_morning_greet_date(user_id: str, ymd: str):
-    _kv_set(user_id, "last_morning_greet_date", ymd)
-
-# ---------- Emotion ----------
 def _clamp(x, lo=-1.0, hi=1.0):
     return max(lo, min(hi, x))
 
 def _tag_from_state(v, a, t):
-    # 雑だけど「それっぽい」タグにする
     if t > 0.55 and v > 0.15:
         return "affectionate"
     if v > 0.35 and a > 0.1:
@@ -180,50 +106,186 @@ def _tag_from_state(v, a, t):
         return "calm"
     return "neutral"
 
-def _load_emotion(user_id: str):
-    init_db()
-    conn = _conn()
-    cur = conn.cursor()
-    cur.execute("SELECT valence, arousal, tone, tag FROM user_emotion WHERE user_id=?", (str(user_id),))
-    row = cur.fetchone()
-    if not row:
-        # 初期
-        conn.close()
-        return 0.0, 0.0, 0.0, "neutral"
-    conn.close()
-    return float(row[0]), float(row[1]), float(row[2]), str(row[3])
 
-def _save_emotion(user_id: str, v: float, a: float, t: float, tag: str):
-    init_db()
-    conn = _conn()
-    cur = conn.cursor()
-    cur.execute("""
-    INSERT INTO user_emotion(user_id, valence, arousal, tone, tag) VALUES(?, ?, ?, ?, ?)
-    ON CONFLICT(user_id) DO UPDATE SET
-        valence=excluded.valence,
-        arousal=excluded.arousal,
-        tone=excluded.tone,
-        tag=excluded.tag
-    """, (str(user_id), float(v), float(a), float(t), str(tag)))
-    conn.commit()
-    conn.close()
+# ---------------- public API ----------------
+def init_db():
+    """
+    GitHub上のJSONを読み込み、メモリに復元する。
+    ファイルが無ければ新規作成状態で開始。
+    """
+    global _state, _sha, _dirty, _last_flush_ts, _dirty_since_ts
 
+    _ensure_env()
+
+    if _state is not None:
+        return
+
+    status, payload = _gh_request("GET", _gh_contents_url(), None)
+
+    if status == 200 and "content" in payload:
+        content_b64 = payload["content"]
+        _sha = payload.get("sha")
+        decoded = base64.b64decode(content_b64).decode("utf-8")
+        try:
+            _state = json.loads(decoded)
+        except Exception:
+            _state = _default_state()
+    elif status == 404:
+        _state = _default_state()
+        _sha = None
+        _mark_dirty()  # 初回は作りたい
+    else:
+        raise RuntimeError(f"GitHub読み込み失敗: HTTP {status} {payload}")
+
+    _dirty = False
+    _dirty_since_ts = 0.0
+    _last_flush_ts = _now()
+
+def flush(force: bool = False):
+    """
+    GitHubに保存。force=True で即保存。
+    """
+    global _sha, _dirty, _last_flush_ts, _dirty_since_ts
+
+    init_db()
+
+    if not _dirty and not force:
+        return
+
+    # 連投抑制
+    now = _now()
+    if (not force) and (now - _last_flush_ts < MIN_FLUSH_INTERVAL_SEC):
+        return
+
+    _state["meta"]["last_saved"] = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
+
+    raw = json.dumps(_state, ensure_ascii=False, separators=(",", ":"))
+    content_b64 = base64.b64encode(raw.encode("utf-8")).decode("utf-8")
+
+    body = {
+        "message": "Update ruby memory",
+        "content": content_b64,
+        "branch": GITHUB_BRANCH,
+    }
+    if _sha:
+        body["sha"] = _sha
+
+    status, payload = _gh_request("PUT", _gh_put_url(), body)
+
+    if status in (200, 201):
+        _sha = payload.get("content", {}).get("sha", _sha)
+        _dirty = False
+        _dirty_since_ts = 0.0
+        _last_flush_ts = now
+        return
+
+    # sha競合など：一回だけ取り直して再実行
+    if status == 409:
+        st2, p2 = _gh_request("GET", _gh_contents_url(), None)
+        if st2 == 200 and "sha" in p2:
+            _sha = p2["sha"]
+            body["sha"] = _sha
+            st3, p3 = _gh_request("PUT", _gh_put_url(), body)
+            if st3 in (200, 201):
+                _sha = p3.get("content", {}).get("sha", _sha)
+                _dirty = False
+                _dirty_since_ts = 0.0
+                _last_flush_ts = now
+                return
+
+    raise RuntimeError(f"GitHub保存失敗: HTTP {status} {payload}")
+
+def maybe_flush():
+    """
+    bot側でちょこちょこ呼んでOK。
+    汚れが溜まったら勝手に保存する。
+    """
+    init_db()
+
+    if not _dirty:
+        return
+
+    now = _now()
+    # 最短間隔を過ぎてたら保存
+    if now - _last_flush_ts >= MIN_FLUSH_INTERVAL_SEC:
+        flush(force=False)
+        return
+
+    # 汚れてから一定時間経ってたら強制
+    if _dirty_since_ts and (now - _dirty_since_ts >= FORCE_FLUSH_AFTER_DIRTY_SEC):
+        flush(force=True)
+
+# ---------- Nickname ----------
+def set_nickname(user_id: str, nickname: str):
+    init_db()
+    _state["nicknames"][str(user_id)] = nickname
+    _mark_dirty()
+
+def get_nickname(user_id: str):
+    init_db()
+    return _state["nicknames"].get(str(user_id))
+
+# ---------- Daily counts ----------
+def get_daily_count(user_id: str, ymd: str):
+    init_db()
+    key = f"{user_id}|{ymd}"
+    return int(_state["daily_counts"].get(key, 0))
+
+def increment_daily_count(user_id: str, ymd: str):
+    init_db()
+    key = f"{user_id}|{ymd}"
+    _state["daily_counts"][key] = int(_state["daily_counts"].get(key, 0)) + 1
+    _mark_dirty()
+
+# ---------- Channel messages ----------
+def add_channel_message(channel_id: str, author_id: str, content: str):
+    init_db()
+    cid = str(channel_id)
+    arr = _state["channel_messages"].get(cid, [])
+    arr.append({"a": str(author_id), "c": str(content), "t": int(_now())})
+    # cap
+    if len(arr) > MAX_MSG_PER_CHANNEL:
+        arr = arr[-MAX_MSG_PER_CHANNEL:]
+    _state["channel_messages"][cid] = arr
+    _mark_dirty()
+
+def get_recent_messages(channel_id: str, limit: int = 12):
+    init_db()
+    cid = str(channel_id)
+    arr = _state["channel_messages"].get(cid, [])
+    sliced = arr[-int(limit):]
+    return [(m["a"], m["c"]) for m in sliced]
+
+# ---------- KV ----------
+def _kv_get(user_id: str, key: str):
+    init_db()
+    return _state["user_kv"].get(f"{user_id}|{key}")
+
+def _kv_set(user_id: str, key: str, value: str):
+    init_db()
+    _state["user_kv"][f"{user_id}|{key}"] = str(value)
+    _mark_dirty()
+
+def get_last_morning_greet_date(user_id: str):
+    return _kv_get(user_id, "last_morning_greet_date")
+
+def set_last_morning_greet_date(user_id: str, ymd: str):
+    _kv_set(user_id, "last_morning_greet_date", ymd)
+
+# ---------- Emotion ----------
 def update_emotion_by_text(user_id: str, text: str, chichi: bool):
-    """
-    雑な感情推定で、ユーザーごとの感情ステートを更新して返す。
-    return: (valence, arousal, tone, tag)
-    """
-    v, a, t, _ = _load_emotion(user_id)
+    init_db()
+    uid = str(user_id)
+    emo = _state["user_emotion"].get(uid, {"v": 0.0, "a": 0.0, "t": 0.0, "tag": "neutral"})
+    v, a, t = float(emo["v"]), float(emo["a"]), float(emo["t"])
 
     s = (text or "")
-    s_lower = s.lower()
 
-    # デフォルトはちょい減衰（落ち着いていく）
+    # 減衰（落ち着く）
     v *= 0.92
     a *= 0.90
     t *= 0.94
 
-    # ポジネガ
     pos = ["好き", "すき", "かわいい", "可愛い", "ありがとう", "ありがと", "最高", "嬉", "うれしい", "えらい", "天才", "神"]
     neg = ["つらい", "辛い", "しんどい", "むり", "無理", "最悪", "きらい", "嫌い", "うざ", "腹立", "むかつく", "泣"]
     excite = ["！", "!", "www", "笑", "やば", "すご", "最高"]
@@ -241,19 +303,16 @@ def update_emotion_by_text(user_id: str, text: str, chichi: bool):
     if any(w in s for w in affection):
         t += 0.22
         v += 0.10
-
     if any(w in s for w in excite):
         a += 0.12
 
-    # ちち補正：少しだけ甘さが上がりやすい
     if chichi:
         t += 0.06
         v += 0.03
 
-    v = _clamp(v)
-    a = _clamp(a)
-    t = _clamp(t)
-
+    v = _clamp(v); a = _clamp(a); t = _clamp(t)
     tag = _tag_from_state(v, a, t)
-    _save_emotion(user_id, v, a, t, tag)
+
+    _state["user_emotion"][uid] = {"v": v, "a": a, "t": t, "tag": tag}
+    _mark_dirty()
     return v, a, t, tag
